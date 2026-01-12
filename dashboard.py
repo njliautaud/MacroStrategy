@@ -80,9 +80,9 @@ def show_popup_dashboard():
     ax6 = plt.subplot2grid((6, 4), (3, 2), colspan=2)
     ax6.axis('off')
     formula_text = "EVOLVED SYMBOLIC FORMULAS\n--------------------------\n"
-    for r, model in results['regime_models'].items():
+    for r, model_data in results['regime_models'].items():
         # Truncate long formulas
-        prog = str(model._program)
+        prog = str(model_data["formula"])
         if len(prog) > 80: prog = prog[:77] + "..."
         formula_text += f"Regime {r}: {prog}\n"
     ax6.text(0.05, 0.5, formula_text, fontsize=10, family='monospace', verticalalignment='center', color='#00ffff')

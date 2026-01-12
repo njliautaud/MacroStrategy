@@ -2,14 +2,15 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 import warnings
+import operator
+import math
 from statsmodels.tsa.stattools import grangercausalitytests
 from sklearn.preprocessing import StandardScaler
-from deap import base, creator, tools, algorithms
-from gplearn.genetic import SymbolicRegressor, SymbolicTransformer
+from deap import base, creator, tools, algorithms, gp
 from hmmlearn import hmm
 import config
 
-# Suppress annoying FutureWarnings from statsmodels and pandas
+# Suppress annoying FutureWarnings
 warnings.filterwarnings('ignore', category=FutureWarning)
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -34,11 +35,12 @@ class FractionalDifferentiator:
     @classmethod
     def frac_diff(cls, series, d, threshold=1e-5):
         """Fractionally differentiate a series with degree d."""
-        weights = cls.get_weights(d, len(series))
-        # For performance, we limit weights by threshold
+        # Use a fixed window for performance
+        window = 50
+        weights = cls.get_weights(d, window)
         weights = weights[np.abs(weights) > threshold]
         res = series.rolling(len(weights)).apply(lambda x: np.dot(x, weights), raw=True)
-        return res.fillna(method='bfill')
+        return res.bfill()
 
 class RegimeClassifier:
     """Classifies market regimes using Hidden Markov Models (HMM)."""
@@ -48,9 +50,7 @@ class RegimeClassifier:
         self.scaler = StandardScaler()
 
     def fit_predict(self, macro_df):
-        """Fits HMM on macro data and returns regime labels."""
-        # Use key macro indicators for regime detection: Yield Curve, Vol, and Industrial Prod
-        features = macro_df.pct_change().dropna()
+        features = macro_df.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0)
         scaled_features = self.scaler.fit_transform(features)
         self.model.fit(scaled_features)
         regimes = self.model.predict(scaled_features)
@@ -59,7 +59,6 @@ class RegimeClassifier:
 class FeatureEngineer:
     @staticmethod
     def compute_all_features(df, graph=None):
-        """Advanced feature engineering: Flows, Beta, IV, and FRAC-DIFF Memory."""
         df = df[~df.index.duplicated(keep='first')]
         features = {}
         
@@ -78,23 +77,6 @@ class FeatureEngineer:
         commodity_nodes = config.ASSET_UNIVERSE.get("commodities_futures", {})
         all_commodity_tickers = [t for sub in commodity_nodes.values() for t in sub]
 
-        # Individual flows
-        individual_flows = {}
-        for col in df.columns:
-            if col in macro_ids or "_volume" in col: continue
-            returns = df[col].pct_change()
-            vol_col = f"{col}_volume"
-            if vol_col in df.columns:
-                individual_flows[col] = np.sign(returns) * df[vol_col]
-            else:
-                individual_flows[col] = pd.Series(0, index=df.index)
-
-        # Sector flows
-        sector_flows = {}
-        for sec, t_list in sector_to_tickers.items():
-            valid_ts = [t for t in t_list if t in individual_flows]
-            sector_flows[sec] = pd.concat([individual_flows[t] for t in valid_ts], axis=1).mean(axis=1) if valid_ts else pd.Series(0, index=df.index)
-
         spy_returns = df["SPY"].pct_change() if "SPY" in df.columns else None
 
         for col in df.columns:
@@ -105,14 +87,14 @@ class FeatureEngineer:
             vol_series = df[vol_col] if vol_col in df.columns else None
             returns = col_series.pct_change()
             
-            # 1. NEW: FRAC-DIFF MEMORY (Degree 0.4 preserves memory while being stationary)
+            # 1. FRAC-DIFF MEMORY
             features[f"{col}_frac_mem"] = FractionalDifferentiator.frac_diff(col_series, d=0.4)
             
             features[f"{col}_momentum_1m"] = col_series.pct_change(21)
             features[f"{col}_momentum_3m"] = col_series.pct_change(63)
             features[f"{col}_volatility_1m"] = returns.rolling(21).std() * np.sqrt(252)
             
-            # Beta & IV Proxy
+            # Beta & IV
             if spy_returns is not None:
                 features[f"{col}_beta"] = returns.rolling(63).cov(spy_returns) / (spy_returns.rolling(63).var() + 1e-9)
             else: features[f"{col}_beta"] = 1.0
@@ -148,12 +130,15 @@ class FeatureEngineer:
             features[f"{col}_upstream_pressure_1st"] = p_1st
             features[f"{col}_upstream_pressure_2nd"] = p_2nd
             features[f"{col}_cost_headwind_score"] = cost_h
+            
+            if "DGS10" in df.columns:
+                features[f"{col}_macro_alignment"] = returns.rolling(63).corr(df["DGS10"].pct_change().rolling(63).mean())
+            else: features[f"{col}_macro_alignment"] = 0
 
         return pd.DataFrame(features).fillna(0)
 
     @staticmethod
     def get_flow_series(df):
-        """Calculates historical net flow series for all sectors."""
         df = df[~df.index.duplicated(keep='first')]
         sector_to_tickers = {}
         for cat, sectors in config.ASSET_UNIVERSE.items():
@@ -177,31 +162,59 @@ class FeatureEngineer:
             if valid: sector_flow_df[sec] = pd.concat([net_flows[t] for t in valid], axis=1).mean(axis=1)
         return {"sector_flows": sector_flow_df.fillna(0)}
 
+def protected_div(left, right):
+    return left / right if abs(right) > 1e-6 else 1.0
+
+def gen_rand():
+    return np.random.uniform(-1, 1)
+
 class SymbolicOptimizer:
-    """Evolves mathematical formulas for alpha generation using Symbolic Regression."""
-    def __init__(self, n_gen=5):
-        self.model = SymbolicRegressor(
-            population_size=500,
-            generations=n_gen,
-            stopping_criteria=0.01,
-            p_crossover=0.7,
-            p_subtree_mutation=0.1,
-            p_hoist_mutation=0.05,
-            p_point_mutation=0.1,
-            max_samples=0.9,
-            verbose=1,
-            function_set=('add', 'sub', 'mul', 'div', 'sqrt', 'log', 'abs', 'neg', 'inv', 'tan', 'tanh'),
-            parsimony_coefficient=0.01,
-            random_state=42
-        )
+    """Robust Symbolic Regression using DEAP (Genetic Programming)."""
+    def __init__(self, n_features, n_gen=5):
+        self.pset = gp.PrimitiveSet("MAIN", n_features)
+        self.pset.addPrimitive(operator.add, 2)
+        self.pset.addPrimitive(operator.sub, 2)
+        self.pset.addPrimitive(operator.mul, 2)
+        self.pset.addPrimitive(protected_div, 2)
+        self.pset.addPrimitive(math.tanh, 1)
+        self.pset.addPrimitive(operator.neg, 1)
+        self.pset.addEphemeralConstant("rand101", gen_rand)
+        
+        if not hasattr(creator, "FitnessMaxGP"):
+            creator.create("FitnessMaxGP", base.Fitness, weights=(1.0,))
+        if not hasattr(creator, "IndividualGP"):
+            creator.create("IndividualGP", gp.PrimitiveTree, fitness=creator.FitnessMaxGP)
+
+        self.toolbox = base.Toolbox()
+        self.toolbox.register("expr", gp.genHalfAndHalf, pset=self.pset, min_=1, max_=2)
+        self.toolbox.register("individual", tools.initIterate, creator.IndividualGP, self.toolbox.expr)
+        self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
+        self.toolbox.register("compile", gp.compile, pset=self.pset)
+
+    def _evaluate(self, individual, X, y):
+        func = self.toolbox.compile(expr=individual)
+        try:
+            # Vectorized evaluation
+            preds = np.array([func(*record) for record in X])
+            # Correlation as fitness
+            corr = np.corrcoef(preds, y)[0, 1] if np.std(preds) > 1e-6 else 0
+            return (corr if not np.isnan(corr) else 0.0,)
+        except:
+            return (0.0,)
 
     def fit(self, X, y):
-        self.model.fit(X, y)
-        print(f"Evolved Formula: {self.model._program}")
-        return self.model
+        self.toolbox.register("evaluate", self._evaluate, X=X, y=y)
+        self.toolbox.register("select", tools.selTournament, tournsize=3)
+        self.toolbox.register("mate", gp.cxOnePoint)
+        self.toolbox.register("expr_mut", gp.genFull, min_=0, max_=2)
+        self.toolbox.register("mutate", gp.mutUniform, expr=self.toolbox.expr_mut, pset=self.pset)
+        
+        pop = self.toolbox.population(n=100)
+        hof = tools.HallOfFame(1)
+        algorithms.eaSimple(pop, self.toolbox, 0.5, 0.2, 5, halloffame=hof, verbose=False)
+        return hof[0]
 
 class RegimeAwareGeneticOptimizer:
-    """Orchestrates regime-specific GA and Symbolic optimization."""
     def __init__(self, prices_df, feature_df, regimes):
         self.prices_df = prices_df
         self.feature_df = feature_df
@@ -209,20 +222,33 @@ class RegimeAwareGeneticOptimizer:
         self.regime_models = {}
 
     def optimize(self):
-        """Trains a distinct Symbolic formula for each market regime."""
         unique_regimes = self.regimes.unique()
         for r in unique_regimes:
-            print(f"\nOptimizing Formula for Regime {r}...")
+            print(f"Optimizing Formula for Regime {r}...")
             r_dates = self.regimes[self.regimes == r].index
-            # Sample data from this regime
-            X = self.feature_df.loc[r_dates].tail(500) # Last 500 points of this regime
-            # Target: Forward 21-day average return across universe
-            # (Simplified target for symbolic regression)
-            tickers = list(set([c.split('_')[0] for c in self.feature_df.columns if '_' in c]))
-            y = self.prices_df[tickers].pct_change(21).shift(-21).mean(axis=1).loc[X.index].fillna(0)
+            if len(r_dates) < 20: continue
             
-            sym = SymbolicOptimizer(n_gen=5)
-            self.regime_models[r] = sym.fit(X, y)
+            # Use universe average return as proxy target
+            tickers = list(set([c.split('_')[0] for c in self.feature_df.columns if '_' in c]))
+            X_data = []
+            y_data = []
+            
+            # Sample subset for training speed
+            sample_dates = r_dates[-100:] if len(r_dates) > 100 else r_dates
+            for date in sample_dates:
+                # Average universe features
+                u_feats = []
+                for f in config.FEATURE_SET:
+                    vals = [self.feature_df.get(f"{t}_{f}", pd.Series(0, index=self.feature_df.index)).loc[date] for t in tickers]
+                    u_feats.append(np.mean(vals))
+                X_data.append(u_feats)
+                y_data.append(self.prices_df[tickers].pct_change(21).shift(-21).mean(axis=1).loc[date])
+
+            X_np = np.nan_to_num(np.array(X_data))
+            y_np = np.nan_to_num(np.array(y_data))
+            
+            sym = SymbolicOptimizer(n_features=len(config.FEATURE_SET))
+            self.regime_models[r] = {"formula": sym.fit(X_np, y_np), "pset": sym.pset}
         return self.regime_models
 
 class CausalEngine:
@@ -269,24 +295,25 @@ class Backtester:
 
         for i in range(len(rebalance_dates)-1):
             start = rebalance_dates[i]; end = rebalance_dates[i+1]
-            # Identify current regime
-            current_regime = regimes.loc[:start].iloc[-1]
-            model = regime_models.get(current_regime)
+            # Ensure start date exists in features, otherwise ffill
+            current_regime = regimes.asof(start)
+            model_data = regime_models.get(current_regime)
+            if not model_data: continue
             
-            # Score all assets using the REGIME-SPECIFIC evolved formula
+            func = gp.compile(model_data["formula"], model_data["pset"])
             scores = {}
             for t in asset_cols:
-                feat_cols = [f"{t}_{f}" for f in config.FEATURE_SET if f"{t}_{f}" in feature_df.columns]
-                if not feat_cols: continue
-                X_input = feature_df[feat_cols].loc[start:start]
-                if not X_input.empty:
-                    # SymbolicRegressor expects the same feature names, we need to align
-                    # (In this simplified version, we'll use momentum/vol ranking if model fails)
-                    scores[t] = model.predict(X_input)[0] if model else 0
+                input_vec = []
+                for f in config.FEATURE_SET:
+                    col = f"{t}_{f}"
+                    val = feature_df[col].asof(start) if col in feature_df.columns else 0
+                    input_vec.append(val)
+                try:
+                    scores[t] = func(*input_vec)
+                except:
+                    scores[t] = 0
             
-            if not scores: continue
             selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
-            
             mask = (returns_df.index > start) & (returns_df.index <= end)
             if returns_df.loc[mask, selected].empty: continue
             
@@ -298,13 +325,14 @@ class Backtester:
                 r = (1 + returns_df.loc[mask, t]).prod() - 1
                 trades.append({'date': start, 'ticker': t, 'sector': ticker_to_sector.get(t, 'unknown'), 'return': r})
 
+        if not portfolio_returns: return {"error": "Insufficient data"}
         all_p_ret = pd.concat(portfolio_returns); all_p_ret = all_p_ret[~all_p_ret.index.duplicated(keep='first')]
         cum_ret = (1 + all_p_ret).cumprod()
         trade_df = pd.DataFrame(trades)
         ann_r = all_p_ret.mean() * 252; ann_v = all_p_ret.std() * np.sqrt(252)
         max_dd = (cum_ret / cum_ret.cummax() - 1).min()
         return {
-            "cumulative_returns": cum_ret, "annualized_return": ann_r, "sharpe_ratio": ann_r/ann_v,
+            "cumulative_returns": cum_ret, "annualized_return": ann_r, "sharpe_ratio": ann_r/(ann_v+1e-9),
             "max_drawdown": max_dd, "trade_analytics": {"hit_rate": (trade_df['return'] > 0).mean()},
             "sector_stats": trade_df.groupby('sector')['return'].agg(['mean', 'sum']).fillna(0),
             "asset_stats": trade_df.groupby('ticker')['return'].agg(['mean', 'sum']).fillna(0),
