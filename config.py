@@ -46,14 +46,11 @@ ASSET_UNIVERSE = {
 
 # Decision Features for GA Optimization
 FEATURE_SET = [
-    "momentum_1m", "momentum_3m", 
-    "volatility_1m",
-    "relative_to_sector", "relative_to_market",
+    "frac_mem", "momentum_1m", "momentum_3m", 
+    "volatility_1m", "beta", "implied_vol_proxy",
+    "flow_intensity", "volume_surge", "net_inflow_pct",
     "causal_centrality", "upstream_pressure_1st", "upstream_pressure_2nd",
-    "macro_alignment", "cost_headwind_score",
-    "flow_intensity", "volume_surge", "money_flow_index",
-    "net_inflow_pct", "sector_flow_pressure",
-    "beta", "implied_vol_proxy"
+    "macro_alignment", "cost_headwind_score"
 ]
 
 # Training / Backtest Configuration
