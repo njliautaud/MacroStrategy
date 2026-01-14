@@ -48,13 +48,17 @@ class FractionalDifferentiator:
             weights.append(-weights[-1] * (d - k + 1) / k)
         return np.array(weights[::-1]).reshape(-1, 1)
 
-    @classmethod
-    def frac_diff(cls, series, d, threshold=1e-5):
+    @staticmethod
+    def frac_diff(series, d, threshold=1e-5):
         """Fractionally differentiate a series with degree d."""
+        # Clean data for stability
+        series = series.ffill().fillna(0)
         # Use a fixed window for performance
         window = 50
-        weights = cls.get_weights(d, window)
+        weights = FractionalDifferentiator.get_weights(d, window)
         weights = weights[np.abs(weights) > threshold]
+        
+        # apply weight-dot-product using rolling apply
         res = series.rolling(len(weights)).apply(lambda x: np.dot(x, weights), raw=True)
         return res.bfill()
 
@@ -322,9 +326,31 @@ def gp_min(a, b):
 def gp_gt(a, b):
     return 1.0 if a > b else 0.0
 
+def evaluate_symbolic(individual, pset, X, y):
+    """Top-level evaluation function for Symbolic GA (Picklable)."""
+    func = gp.compile(expr=individual, pset=pset)
+    try:
+        preds = np.array([func(*record) for record in X])
+        if np.std(preds) < 1e-9: return (0.0,)
+        corr, _ = spearmanr(preds, y)
+        return (corr if np.isfinite(corr) else 0.0,)
+    except:
+        return (0.0,)
+
+def evaluate_execution(individual, pset, X, y):
+    """Top-level evaluation function for Execution GA (Picklable)."""
+    func = gp.compile(expr=individual, pset=pset)
+    try:
+        scores = np.array([func(*record) for record in X])
+        if np.std(scores) < 1e-9: return (0.0,)
+        corr, _ = spearmanr(scores, -y) 
+        return (corr if np.isfinite(corr) else 0.0,)
+    except:
+        return (0.0,)
+
 class SymbolicOptimizer:
     """Advanced Symbolic Regression using DEAP (Genetic Programming)."""
-    def __init__(self, n_features, n_gen=50, pop_size=1000, max_depth=6):
+    def __init__(self, n_features, n_gen=100, pop_size=1500, max_depth=7):
         self.n_gen = n_gen
         self.pop_size = pop_size
         self.max_depth = max_depth
@@ -392,7 +418,7 @@ class SymbolicOptimizer:
 
     def fit(self, X, y):
         ps = self.pset
-        self.toolbox.register("evaluate", self._evaluate, X=X, y=y)
+        self.toolbox.register("evaluate", evaluate_symbolic, pset=ps, X=X, y=y)
         self.toolbox.register("select", tools.selTournament, tournsize=4) # More aggressive selection
         self.toolbox.register("mate", gp.cxOnePoint)
         self.toolbox.register("expr_mut", gp.genFull, min_=0, max_=2)
@@ -406,10 +432,19 @@ class SymbolicOptimizer:
         pop = self.toolbox.population(n=self.pop_size)
         hof = tools.HallOfFame(5)
         
-        # Use eaMuPlusLambda for more robust evolution (Searching deeper branches)
-        algorithms.eaMuPlusLambda(pop, self.toolbox, mu=self.pop_size, lambda_=self.pop_size * 2, 
-                                 cxpb=0.6, mutpb=0.3, ngen=self.n_gen, 
-                                 halloffame=hof, verbose=False)
+        # Use eaMuPlusLambda with a per-generation progress bar
+        print(f"  Starting evolution for {self.n_gen} generations...")
+        with tqdm(total=self.n_gen, desc="  Alpha Evolution", unit="gen") as pbar:
+            for g in range(self.n_gen):
+                # Run one generation at a time to update progress bar
+                algorithms.eaMuPlusLambda(pop, self.toolbox, mu=self.pop_size, lambda_=self.pop_size * 2, 
+                                         cxpb=0.6, mutpb=0.3, ngen=1, 
+                                         halloffame=hof, verbose=False)
+                pbar.update(1)
+                if hof and len(hof) > 0:
+                    best_fit = hof[0].fitness.values[0]
+                    pbar.set_postfix({"best_IC": f"{best_fit:.4f}"})
+        
         return hof[0]
 
 class RegimeAwareGeneticOptimizer:
@@ -422,7 +457,7 @@ class RegimeAwareGeneticOptimizer:
     def optimize(self):
         unique_regimes = self.regimes.unique()
         for r in unique_regimes:
-            print(f"  Evolving Alpha Formula (Unified Discovery, Depth=6, Pop=1000)..." if len(unique_regimes) == 1 else f"  Evolving Alpha Formula for Regime {r} (Advanced GA, Depth=6, Pop=1000)...")
+            print(f"  Evolving Alpha Formula (Unified Discovery, Depth=7, Pop=1500)..." if len(unique_regimes) == 1 else f"  Evolving Alpha Formula for Regime {r} (Advanced GA, Depth=7, Pop=1500)...")
             r_dates = self.regimes[self.regimes == r].index
             if len(r_dates) < 50: continue
             
@@ -465,9 +500,9 @@ class RegimeAwareGeneticOptimizer:
             # Deep search: Larger population, more generations, deeper trees
             sym = SymbolicOptimizer(
                 n_features=len(config.FEATURE_SET), 
-                n_gen=50, 
-                pop_size=1000, 
-                max_depth=6
+                n_gen=100,      # Increased for better convergence
+                pop_size=1500,   # Increased for more diversity
+                max_depth=7      # Increased for capturing higher-order effects
             )
             self.regime_models[r] = {"formula": sym.fit(X_np, y_np), "pset": sym.pset}
         return self.regime_models
@@ -588,14 +623,22 @@ class ExecutionOptimizer:
 
     def fit(self, X, y):
         ps = self.pset
-        self.toolbox.register("evaluate", self._evaluate, X=X, y=y)
+        self.toolbox.register("evaluate", evaluate_execution, pset=ps, X=X, y=y)
         self.toolbox.register("select", tools.selTournament, tournsize=3)
         self.toolbox.register("mate", gp.cxOnePoint)
         self.toolbox.register("mutate", gp.mutUniform, expr=gp.genFull(min_=0, max_=2), pset=ps)
         pop = self.toolbox.population(n=self.pop_size)
         hof = tools.HallOfFame(1)
-        algorithms.eaMuPlusLambda(pop, self.toolbox, mu=self.pop_size, lambda_=self.pop_size, 
-                                 cxpb=0.6, mutpb=0.3, ngen=self.n_gen, halloffame=hof, verbose=False)
+        
+        with tqdm(total=self.n_gen, desc="  Execution Evolution", unit="gen") as pbar:
+            for g in range(self.n_gen):
+                algorithms.eaMuPlusLambda(pop, self.toolbox, mu=self.pop_size, lambda_=self.pop_size, 
+                                         cxpb=0.6, mutpb=0.3, ngen=1, halloffame=hof, verbose=False)
+                pbar.update(1)
+                if hof and len(hof) > 0:
+                    best_fit = hof[0].fitness.values[0]
+                    pbar.set_postfix({"best_fit": f"{best_fit:.4f}"})
+        
         return hof[0]
 
 class Backtester:
@@ -802,7 +845,10 @@ class Backtester:
         end_date,
         retrain_every_n_months=3,
         top_n=8,
-        is_placebo=False
+        is_placebo=False,
+        skip_retraining=False,
+        initial_models=None,
+        collect_predictions=False
     ):
         """
         Expanding walk-forward:
@@ -829,6 +875,7 @@ class Backtester:
         # Performance Tracking
         portfolio_returns = []; model_only_returns = []; no_vol_returns = []
         weight_history = []; trades = []; ic_samples = {f: [] for f in config.FEATURE_SET}
+        predictions_log = {} if collect_predictions else None
         
         # Dual-Model State
         current_models = None; exit_model = None; last_retrain = None
@@ -846,7 +893,7 @@ class Backtester:
 
             do_retrain = (last_retrain is None or (start.year - last_retrain.year)*12 + (start.month - last_retrain.month) >= retrain_every_n_months)
 
-            if do_retrain:
+            if do_retrain and not skip_retraining:
                 if not is_placebo: print(f"  [{start.date()}] Retraining Unified Prediction + Execution Engines...")
                 hist_prices = prices_df.loc[:start]; hist_features = feature_df.loc[:start]
                 
@@ -864,6 +911,10 @@ class Backtester:
                 exit_model = exec_opt.fit(X_ex, y_ex)
                 
                 last_retrain = start
+            elif skip_retraining and current_models is None and initial_models is not None:
+                if not is_placebo:
+                    print(f"  [{start.date()}] Using pre-trained model (skip retraining).")
+                current_models = initial_models
 
             if not current_models: continue
 
@@ -879,6 +930,9 @@ class Backtester:
                     s = func(*input_vec)
                     scores[t] = s if np.isfinite(s) else 0.0
                 except: scores[t] = 0.0
+
+            if collect_predictions:
+                predictions_log[start] = scores.copy()
 
             selected = sorted(scores, key=scores.get, reverse=True)[:top_n]
             if not selected: continue
@@ -976,7 +1030,8 @@ class Backtester:
             "bench_stats": {"return": benchmark_returns.mean()*252, "vol": benchmark_returns.std()*np.sqrt(252)},
             "current_holdings": last_final_weights,
             "weights_history": pd.DataFrame(weight_history).set_index("date"),
-            "asset_stats": pd.DataFrame(trades).groupby('ticker')['return'].sum() if trades else pd.Series()
+            "asset_stats": pd.DataFrame(trades).groupby('ticker')['return'].sum() if trades else pd.Series(),
+            "predictions": predictions_log if collect_predictions else None
         }
 
 

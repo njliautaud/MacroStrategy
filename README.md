@@ -15,16 +15,22 @@ The Macro-Structural Alpha Engine is a data-driven system designed to capture fl
 - `engine.py`: The core engine containing feature engineering, causal network construction, hybrid DL+GA modeling, and scoring logic.
 - `dashboard.py`: Native popup dashboard using Matplotlib (click-to-expand workflow).
 - `run.py`: The main execution script to run the entire pipeline.
+- `train_and_predict.py`: Phase 1 training script that saves a trained model and holdout predictions.
+- `test_execution.py`: Phase 2 execution testing script with a model selector popup and comparison view.
 
 ## Performance & Validation
 The engine includes a **Walk-Forward Expanding Backtest** system with advanced validation:
 1.  **Run Analysis**: `python run.py` fetches data, evolves math formulas via Symbolic Regression, and simulates a walk-forward strategy.
-2.  **Advanced GA Search**: Uses a large population (1000) and deep trees (6 branches) to discover non-linear alpha formulas using primitives like `sin`, `cos`, `log`, `exp`, `tanh`.
-3.  **Statistical Validation**:
+    - The terminal will prompt whether to **skip retraining** during the holdout period for faster validation.
+    - It also saves a **Phase 2 predictions bundle** in `saved_models/` (filename includes `wf-retrain` or `wf-skip`).
+2.  **Train + Save Model**: `python train_and_predict.py` trains on 2010-2022 and saves predictions for 2023-2025.
+3.  **Execution Testing**: `python test_execution.py` lets you select a saved model and compare execution methods side-by-side.
+4.  **Advanced GA Search**: Uses a large population (1000) and deep trees (6 branches) to discover non-linear alpha formulas using primitives like `sin`, `cos`, `log`, `exp`, `tanh`.
+5.  **Statistical Validation**:
     -   **Permutation Test**: Shuffles excess returns to calculate an empirical p-value vs luck.
     -   **Placebo Test**: Shifts features forward to confirm signal decay (anti-overfit check).
     -   **Annualized Alpha**: Tracks pure performance above the benchmark (SPY).
-4.  **View Results**: The **Scrollable Native Dashboard** shows:
+6.  **View Results**: The **Scrollable Native Dashboard** shows:
     -   **Equity Curve vs Luck Thresholds**: Cumulative performance with 1/3-sigma bands.
     -   **Market Regimes**: HMM-based classification (Low/High Vol).
     -   **Feature Alpha Loading**: Directional contribution (Positive/Negative) of each feature to out-of-sample alpha.
@@ -34,7 +40,7 @@ The engine includes a **Walk-Forward Expanding Backtest** system with advanced v
 This project emphasizes **commodities and cross-asset linkages**:
 - Commodity futures + liquid proxy ETFs are included with **commodity flow proxies**.
 - Second-order effects are modeled via **cost-input baskets** (e.g., how metals/energy prices pressure industrial/tech margins).
-- **Symbolic Formulas** are evolved for each market regime independently.
+- **Symbolic Formulas** are evolved in a unified model optimized for cross-asset rotation.
 
 ## Current Phase: Implementation & Integration
-The core engine and data layers are implemented. Future updates will focus on refining the hybrid GA/DL model parameters and expanding the asset universe.
+The core engine and data layers are implemented. A new two-phase workflow enables fast execution-method testing without retraining the model each time.

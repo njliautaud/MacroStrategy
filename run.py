@@ -23,6 +23,10 @@ def main():
     print_resources()
     print("Initializing Macro-Structural Alpha Engine (Symbolic & Regime-Aware)...")
     
+    # Prompt at start so user can walk away
+    skip_input = input("\n  Skip retraining during holdout period (2023-2025) to save time? [y/N]: ").strip().lower()
+    skip_retraining = skip_input == "y"
+
     with tqdm(total=9, desc="Full Pipeline", unit="step") as pbar:
         # 1. Data Ingestion
         dm = data_manager.DataManager()
@@ -77,9 +81,34 @@ def main():
         optimizer = engine.RegimeAwareGeneticOptimizer(dev_prices, dev_features, dev_regimes)
         regime_models = optimizer.optimize()
         pbar.update(1)
+
+        # Save trained model for execution testing (phase 2)
+        os.makedirs("saved_models", exist_ok=True)
+        model_timestamp = time.strftime("%Y%m%d_%H%M%S")
+        model_path = os.path.join("saved_models", f"model_{model_timestamp}.pkl")
+        model_bundle = {
+            "metadata": {
+                "trained_at": model_timestamp,
+                "train_start": config.START_DATE,
+                "train_end": config.TRAIN_END,
+                "holdout_start": config.HOLDOUT_START,
+                "holdout_end": config.HOLDOUT_END,
+                "features_count": all_features.shape[1],
+                "assets_count": len([c for c in clean_data.columns if "_volume" not in c]),
+            },
+            "regime_models": regime_models,
+        }
+        with open(model_path, "wb") as f:
+            pickle.dump(model_bundle, f)
+        print(f"  Saved trained model to {model_path}")
         
         # 7. TRUE HOLDOUT Walk-Forward
         print(f"\n[Step 7/9] Running TRUE HOLDOUT expanding walk-forward ({config.HOLDOUT_START}..{config.HOLDOUT_END})...")
+        if skip_retraining:
+            print("  (Using static pre-trained model for holdout period)")
+        else:
+            print("  (Using periodic walk-forward retraining - this will take a long time)")
+            
         bt = engine.Backtester(dm, engine)
         backtest_results = bt.walk_forward_test_expanding(
             prices_df=clean_data,
@@ -89,6 +118,9 @@ def main():
             end_date=config.HOLDOUT_END,
             retrain_every_n_months=getattr(config, "RETRAIN_EVERY_N_MONTHS", 3),
             top_n=8,
+            skip_retraining=skip_retraining,
+            initial_models=regime_models if skip_retraining else None,
+            collect_predictions=True,
         )
         pbar.update(1)
         
@@ -97,6 +129,38 @@ def main():
             print(f"  Annualized Return: {backtest_results['annualized_return']:.2%}")
             print(f"  Sharpe Ratio: {backtest_results['sharpe_ratio']:.2f}")
             print(f"  Max Drawdown: {backtest_results['max_drawdown']:.2%}")
+
+        # Save predictions bundle for Phase 2 execution testing
+        pred_tag = "wf-skip" if skip_retraining else "wf-retrain"
+        pred_timestamp = time.strftime("%Y%m%d_%H%M%S")
+        os.makedirs("saved_models", exist_ok=True)
+        predictions = backtest_results.get("predictions") if isinstance(backtest_results, dict) else None
+        if predictions:
+            asset_cols = [
+                c for c in clean_data.columns
+                if c not in macro_ids and "_volume" not in c and not c.endswith(("_open", "_high", "_low", "_vwap"))
+            ]
+            pred_path = os.path.join("saved_models", f"predictions_{pred_timestamp}_{pred_tag}.pkl")
+            with open(pred_path, "wb") as f:
+                pickle.dump(
+                    {
+                        "metadata": {
+                            "trained_at": pred_timestamp,
+                            "train_start": config.START_DATE,
+                            "train_end": config.TRAIN_END,
+                            "holdout_start": config.HOLDOUT_START,
+                            "holdout_end": config.HOLDOUT_END,
+                            "top_n_default": 8,
+                            "walkforward_retrain": not skip_retraining,
+                            "source": "run.py",
+                        },
+                        "predictions": predictions,
+                        "asset_cols": asset_cols,
+                        "clean_data": clean_data,
+                    },
+                    f,
+                )
+            print(f"  Saved predictions for Phase 2: {pred_path}")
         
         # 8. Save Results
         print("\n[Step 8/9] Saving results to results.pkl...")
