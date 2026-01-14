@@ -1,0 +1,29 @@
+# Core Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Network & Graph Analysis
+networkx>=3.0
+
+# Statistical Analysis & Machine Learning
+scipy>=1.10.0
+statsmodels>=0.14.0
+scikit-learn>=1.3.0
+hmmlearn>=0.2.7
+
+# Genetic Algorithms (Symbolic Regression)
+deap>=1.3.3
+
+# Data Fetching
+requests>=2.31.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# System Monitoring & Progress Bars
+psutil>=5.9.0
+tqdm>=4.65.0
+
+# Optional: Deep Learning (if you want to enable torch features later)
+# torch>=2.0.0

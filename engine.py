@@ -4,6 +4,8 @@ import networkx as nx
 import warnings
 import operator
 import math
+import multiprocessing
+from tqdm import tqdm
 from statsmodels.tsa.stattools import grangercausalitytests
 from sklearn.preprocessing import StandardScaler
 from deap import base, creator, tools, algorithms, gp
@@ -11,6 +13,18 @@ from hmmlearn import hmm
 from scipy.stats import ttest_1samp, spearmanr
 from scipy.cluster.hierarchy import linkage, dendrogram, leaves_list
 import config
+
+# Global pool for parallel processing
+_gp_pool = None
+
+def get_gp_pool():
+    global _gp_pool
+    if _gp_pool is None:
+        try:
+            _gp_pool = multiprocessing.Pool()
+        except Exception as e:
+            print(f"  Warning: Could not initialize parallel pool ({e}).")
+    return _gp_pool
 
 # Suppress annoying FutureWarnings
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -81,10 +95,10 @@ class FeatureEngineer:
 
         spy_returns = df["SPY"].pct_change() if "SPY" in df.columns else None
 
-        for col in df.columns:
-            if col in macro_ids or "_volume" in col or col.endswith("_open") or col.endswith("_high") or col.endswith("_low") or col.endswith("_vwap"):
-                continue
-            
+        valid_cols = [c for c in df.columns if c not in macro_ids and "_volume" not in c and not c.endswith(("_open", "_high", "_low", "_vwap"))]
+        
+        print(f"  Engineering decision features for {len(valid_cols)} assets...")
+        for col in tqdm(valid_cols, desc="Feature Engineering", unit="asset"):
             col_series = df[col]
             vol_col = f"{col}_volume"
             vol_series = df[vol_col] if vol_col in df.columns else None
@@ -299,6 +313,15 @@ def relu(x):
 def gen_rand():
     return np.random.uniform(-1, 1)
 
+def gp_max(a, b):
+    return max(a, b)
+
+def gp_min(a, b):
+    return min(a, b)
+
+def gp_gt(a, b):
+    return 1.0 if a > b else 0.0
+
 class SymbolicOptimizer:
     """Advanced Symbolic Regression using DEAP (Genetic Programming)."""
     def __init__(self, n_features, n_gen=50, pop_size=1000, max_depth=6):
@@ -329,8 +352,8 @@ class SymbolicOptimizer:
         self.pset.addPrimitive(math.cos, 1)
         
         # Thresholding/Logic Primitives
-        self.pset.addPrimitive(lambda a, b: max(a, b), 2, name="max")
-        self.pset.addPrimitive(lambda a, b: min(a, b), 2, name="min")
+        self.pset.addPrimitive(gp_max, 2, name="max")
+        self.pset.addPrimitive(gp_min, 2, name="min")
         
         self.pset.addEphemeralConstant("rand101", gen_rand)
         
@@ -340,11 +363,19 @@ class SymbolicOptimizer:
             creator.create("IndividualGP", gp.PrimitiveTree, fitness=creator.FitnessMaxGP)
 
         self.toolbox = base.Toolbox()
+        
+        # Parallel Processing support
+        pool = get_gp_pool()
+        if pool:
+            self.toolbox.register("map", pool.map)
+
         # Deep trees: allow depth up to self.max_depth (up to 6 branches deep)
-        self.toolbox.register("expr", gp.genHalfAndHalf, pset=self.pset, min_=1, max_=self.max_depth)
+        md = self.max_depth
+        ps = self.pset
+        self.toolbox.register("expr", gp.genHalfAndHalf, pset=ps, min_=1, max_=md)
         self.toolbox.register("individual", tools.initIterate, creator.IndividualGP, self.toolbox.expr)
         self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
-        self.toolbox.register("compile", gp.compile, pset=self.pset)
+        self.toolbox.register("compile", gp.compile, pset=ps)
 
     def _evaluate(self, individual, X, y):
         func = self.toolbox.compile(expr=individual)
@@ -360,15 +391,17 @@ class SymbolicOptimizer:
             return (0.0,)
 
     def fit(self, X, y):
+        ps = self.pset
         self.toolbox.register("evaluate", self._evaluate, X=X, y=y)
         self.toolbox.register("select", tools.selTournament, tournsize=4) # More aggressive selection
         self.toolbox.register("mate", gp.cxOnePoint)
         self.toolbox.register("expr_mut", gp.genFull, min_=0, max_=2)
-        self.toolbox.register("mutate", gp.mutUniform, expr=self.toolbox.expr_mut, pset=self.pset)
+        self.toolbox.register("mutate", gp.mutUniform, expr=self.toolbox.expr_mut, pset=ps)
         
         # Limit height to avoid bloat
-        self.toolbox.decorate("mate", gp.staticLimit(key=operator.attrgetter("height"), max_value=self.max_depth + 2))
-        self.toolbox.decorate("mutate", gp.staticLimit(key=operator.attrgetter("height"), max_value=self.max_depth + 2))
+        md = self.max_depth
+        self.toolbox.decorate("mate", gp.staticLimit(key=operator.attrgetter("height"), max_value=md + 2))
+        self.toolbox.decorate("mutate", gp.staticLimit(key=operator.attrgetter("height"), max_value=md + 2))
 
         pop = self.toolbox.population(n=self.pop_size)
         hof = tools.HallOfFame(5)
@@ -448,7 +481,9 @@ class CausalEngine:
         data_tickers = [t for t in data.columns if "_volume" not in t]
         self.graph.add_nodes_from(data_tickers)
         corr_matrix = data[data_tickers].corr()
-        for target in data_tickers:
+        
+        print(f"  Constructing causal network for {len(data_tickers)} potential nodes...")
+        for target in tqdm(data_tickers, desc="Causal Construction", unit="node"):
             for source in data_tickers:
                 if source == target: continue
                 if abs(corr_matrix.loc[source, target]) > 0.3:
@@ -516,7 +551,7 @@ class ExecutionOptimizer:
         self.pset.addPrimitive(protected_div, 2)
         self.pset.addPrimitive(math.tanh, 1)
         self.pset.addPrimitive(sigmoid, 1)
-        self.pset.addPrimitive(lambda a, b: 1.0 if a > b else 0.0, 2, name="gt")
+        self.pset.addPrimitive(gp_gt, 2, name="gt")
         self.pset.addEphemeralConstant("rand_exit", gen_rand)
 
         if not hasattr(creator, "FitnessMaxExit"):
@@ -525,10 +560,17 @@ class ExecutionOptimizer:
             creator.create("IndividualExit", gp.PrimitiveTree, fitness=creator.FitnessMaxExit)
 
         self.toolbox = base.Toolbox()
-        self.toolbox.register("expr", gp.genHalfAndHalf, pset=self.pset, min_=1, max_=3)
+        
+        # Parallel Processing support
+        pool = get_gp_pool()
+        if pool:
+            self.toolbox.register("map", pool.map)
+
+        ps = self.pset
+        self.toolbox.register("expr", gp.genHalfAndHalf, pset=ps, min_=1, max_=3)
         self.toolbox.register("individual", tools.initIterate, creator.IndividualExit, self.toolbox.expr)
         self.toolbox.register("population", tools.initRepeat, list, self.toolbox.individual)
-        self.toolbox.register("compile", gp.compile, pset=self.pset)
+        self.toolbox.register("compile", gp.compile, pset=ps)
         self.n_gen = n_gen
         self.pop_size = pop_size
 
@@ -545,10 +587,11 @@ class ExecutionOptimizer:
         except: return (0.0,)
 
     def fit(self, X, y):
+        ps = self.pset
         self.toolbox.register("evaluate", self._evaluate, X=X, y=y)
         self.toolbox.register("select", tools.selTournament, tournsize=3)
         self.toolbox.register("mate", gp.cxOnePoint)
-        self.toolbox.register("mutate", gp.mutUniform, expr=gp.genFull(min_=0, max_=2), pset=self.pset)
+        self.toolbox.register("mutate", gp.mutUniform, expr=gp.genFull(min_=0, max_=2), pset=ps)
         pop = self.toolbox.population(n=self.pop_size)
         hof = tools.HallOfFame(1)
         algorithms.eaMuPlusLambda(pop, self.toolbox, mu=self.pop_size, lambda_=self.pop_size, 
@@ -797,7 +840,8 @@ class Backtester:
             for s_name, tickers in sectors.items():
                 for t in tickers: ticker_to_sector[t] = s_name
 
-        for i in range(len(rebalance_dates) - 1):
+        print(f"  Walking forward from {start_date} to {end_date} ({len(rebalance_dates)-1} rebalances)...")
+        for i in tqdm(range(len(rebalance_dates) - 1), desc="Walk-Forward Backtest", unit="rebalance"):
             start = rebalance_dates[i]; end = rebalance_dates[i + 1]
 
             do_retrain = (last_retrain is None or (start.year - last_retrain.year)*12 + (start.month - last_retrain.month) >= retrain_every_n_months)
