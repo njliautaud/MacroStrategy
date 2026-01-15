@@ -9,9 +9,15 @@ from tkinter import ttk
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
-def make_fullscreen(event, fig, ax):
+def make_fullscreen(event, fig, ax, parent=None):
     # Create a new window for the fullscreen plot
-    top = tk.Toplevel(fig.canvas.manager.window)
+    parent_window = parent
+    if parent_window is None:
+        try:
+            parent_window = fig.canvas.manager.window
+        except Exception:
+            parent_window = None
+    top = tk.Toplevel(parent_window) if parent_window is not None else tk.Toplevel()
     top.title(ax.get_title())
     
     full_fig = Figure(figsize=(12, 8), dpi=100)
@@ -103,7 +109,7 @@ def show_popup_dashboard():
     ax1.set_title('Engine Audit: Execution Impact vs. Raw Model Alpha', fontsize=14, pad=15)
     ax1.legend(loc='upper left', fontsize=10)
     ax1.grid(alpha=0.1)
-    fig.canvas.mpl_connect('button_press_event', lambda event: make_fullscreen(event, fig, ax1) if event.inaxes == ax1 else None)
+    fig.canvas.mpl_connect('button_press_event', lambda event: make_fullscreen(event, fig, ax1, root) if event.inaxes == ax1 else None)
 
     # 2. Performance Stats Card (With Dual-Engine Analytics)
     ax2 = plt.subplot2grid((9, 4), (0, 3), rowspan=2)
@@ -124,6 +130,11 @@ def show_popup_dashboard():
         f"-----------------------\n"
         f"Vol Impact: {backtest.get('vol_targeting_impact', 0):>+6.1%} (Risk Mgmt)\n"
         f"Model Alpha:{backtest.get('selection_alpha', 0):>+6.1%} (Selection)\n\n"
+        f"MODEL QUALITY (ALPHA)\n"
+        f"-----------------------\n"
+        f"Decile:     {backtest.get('model_quality', {}).get('decile_spread', 0):>+6.1%}\n"
+        f"Long/Short: {backtest.get('model_quality', {}).get('long_short', 0):>+6.1%}\n"
+        f"Top-N A:    {backtest.get('model_quality', {}).get('top_n_alpha', 0):>+6.1%}\n\n"
         f"VALIDATION (Holdout)\n"
         f"--------------------\n"
         f"T-Stat:     {backtest.get('t_stat', 0):.2f}\n"
@@ -154,7 +165,7 @@ def show_popup_dashboard():
             ax3.tick_params(axis='y', labelsize=7)
         else:
             ax3.text(0.5, 0.5, 'Flow Data Missing', ha='center')
-    fig.canvas.mpl_connect('button_press_event', lambda event: make_fullscreen(event, fig, ax3) if event.inaxes == ax3 else None)
+    fig.canvas.mpl_connect('button_press_event', lambda event: make_fullscreen(event, fig, ax3, root) if event.inaxes == ax3 else None)
 
     # 4. Global Flow Pressure by Group (equity sectors + ETF groups + commodities/proxies)
     ax4 = plt.subplot2grid((9, 4), (3, 0), colspan=4)
@@ -178,18 +189,24 @@ def show_popup_dashboard():
     ax5.set_title('Dynamic Sector Positioning', fontsize=12)
     ax5.set_ylabel('Sectors', fontsize=10)
 
-    # 6. Directional Alpha Contribution (Centered at 0)
+    # 6. Feature Alpha Loading (Directional Influence)
     ax6 = plt.subplot2grid((9, 4), (4, 2), colspan=2, rowspan=2)
     loadings = pd.Series(backtest.get('feature_loadings', {}))
-    loadings = loadings.sort_values(ascending=True)
-    
-    # Color coding: Green for positive predictors, Red for negative predictors
-    colors = ['#00ff00' if x > 0 else '#ff4444' for x in loadings.values]
-    ax6.barh(loadings.index, loadings.values, color=colors, alpha=0.8)
-    ax6.axvline(0, color='white', linewidth=1, alpha=0.5)
-    ax6.set_title('Feature Alpha Loading (Directional Influence)', fontsize=12)
-    ax6.tick_params(axis='y', labelsize=8)
-    ax6.grid(alpha=0.1, axis='x')
+    if not loadings.empty and not (loadings == 0).all():
+        loadings = loadings.sort_values(ascending=True)
+        # Filter out features with 0 loading for cleaner plot
+        loadings = loadings[loadings != 0]
+        if not loadings.empty:
+            colors = ['#00ff00' if x > 0 else '#ff4444' for x in loadings.values]
+            ax6.barh(loadings.index, loadings.values, color=colors, alpha=0.8)
+            ax6.axvline(0, color='white', linewidth=1, alpha=0.5)
+            ax6.set_title('Feature Alpha Loading (Directional IC)', fontsize=12)
+            ax6.tick_params(axis='y', labelsize=8)
+            ax6.grid(alpha=0.1, axis='x')
+        else:
+            ax6.text(0.5, 0.5, 'No Significant Loadings', ha='center', va='center')
+    else:
+        ax6.text(0.5, 0.5, 'Feature Loadings Missing (IC=0)', ha='center', va='center')
 
     # ... (Keep formula card)
 
@@ -221,14 +238,27 @@ def show_popup_dashboard():
 
     # 8. Asset Alpha Contributors
     ax8 = plt.subplot2grid((9, 4), (7, 0), colspan=2, rowspan=2)
-    top_assets = backtest['asset_stats'].sort_values('sum', ascending=False).head(15)
-    # Color coding: Green for positive, Red for negative
-    colors = ['#00ff00' if x > 0 else '#ff4444' for x in top_assets['sum']]
-    ax8.barh(top_assets.index, top_assets['sum'], color=colors, alpha=0.7)
-    ax8.set_title('Top 15 Alpha-Positive Tickers', fontsize=12)
-    ax8.invert_yaxis()
-    ax8.tick_params(axis='y', labelsize=9)
-    ax8.grid(alpha=0.1, axis='x')
+    asset_stats = backtest.get('asset_stats')
+    top_assets = None
+    if isinstance(asset_stats, pd.DataFrame):
+        if 'sum' in asset_stats.columns:
+            top_assets = asset_stats['sum']
+        elif 'return' in asset_stats.columns:
+            top_assets = asset_stats['return']
+    elif isinstance(asset_stats, pd.Series):
+        top_assets = asset_stats
+
+    if top_assets is not None and not top_assets.empty:
+        top_assets = top_assets.sort_values(ascending=False).head(15)
+        # Color coding: Green for positive, Red for negative
+        colors = ['#00ff00' if x > 0 else '#ff4444' for x in top_assets.values]
+        ax8.barh(top_assets.index, top_assets.values, color=colors, alpha=0.7)
+        ax8.set_title('Top 15 Alpha-Positive Tickers', fontsize=12)
+        ax8.invert_yaxis()
+        ax8.tick_params(axis='y', labelsize=9)
+        ax8.grid(alpha=0.1, axis='x')
+    else:
+        ax8.text(0.5, 0.5, 'Asset Stats Missing', ha='center', va='center')
 
     # 9. Inter-Market Dependency Monitor (Commodity/Energy/Metals -> Equities focus)
     ax9 = plt.subplot2grid((9, 4), (7, 2), colspan=2, rowspan=2)

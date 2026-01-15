@@ -3,6 +3,7 @@ import pickle
 import time
 
 import pandas as pd
+import numpy as np
 
 import config
 import data_manager
@@ -51,14 +52,19 @@ def generate_predictions(clean_data, feature_df, regime_models, top_n=8):
     predictions = {}
     model_data = next(iter(regime_models.values()))
     func = engine.gp.compile(model_data["formula"], model_data["pset"])
+    scaler = model_data.get("scaler")
 
     for dt in rebalance_dates:
         scores = {}
         for t in asset_cols:
-            input_vec = [
+            raw_vec = [
                 feature_df[f"{t}_{f}"].asof(dt) if f"{t}_{f}" in feature_df.columns else 0
                 for f in config.FEATURE_SET
             ]
+            input_vec = raw_vec
+            if scaler is not None:
+                input_vec = scaler.transform([raw_vec])[0]
+                input_vec = np.clip(input_vec, -5, 5)
             try:
                 s = func(*input_vec)
                 scores[t] = s if pd.notna(s) else 0.0

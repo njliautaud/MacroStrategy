@@ -26,6 +26,10 @@ def main():
     # Prompt at start so user can walk away
     skip_input = input("\n  Skip retraining during holdout period (2023-2025) to save time? [y/N]: ").strip().lower()
     skip_retraining = skip_input == "y"
+    lite_input = input("  Run in lightweight mode (faster, lower GA depth)? [y/N]: ").strip().lower()
+    lightweight_mode = lite_input == "y"
+    if lightweight_mode:
+        print("  Lightweight mode enabled: smaller GA population/generations/depth.")
 
     with tqdm(total=9, desc="Full Pipeline", unit="step") as pbar:
         # 1. Data Ingestion
@@ -78,14 +82,27 @@ def main():
         dev_regimes = regimes.loc[:config.TRAIN_END] if isinstance(regimes, pd.Series) else pd.Series(0, index=dev_prices.index)
         
         print(f"  Training on {len(dev_prices)} history points with {all_features.shape[1]} features.")
-        optimizer = engine.RegimeAwareGeneticOptimizer(dev_prices, dev_features, dev_regimes)
+        if lightweight_mode:
+            ga_params = {"n_gen": 25, "pop_size": 300, "max_depth": 4}
+        else:
+            ga_params = {"n_gen": 100, "pop_size": 1500, "max_depth": 7}
+
+        optimizer = engine.RegimeAwareGeneticOptimizer(
+            dev_prices,
+            dev_features,
+            dev_regimes,
+            n_gen=ga_params["n_gen"],
+            pop_size=ga_params["pop_size"],
+            max_depth=ga_params["max_depth"],
+        )
         regime_models = optimizer.optimize()
         pbar.update(1)
 
         # Save trained model for execution testing (phase 2)
         os.makedirs("saved_models", exist_ok=True)
         model_timestamp = time.strftime("%Y%m%d_%H%M%S")
-        model_path = os.path.join("saved_models", f"model_{model_timestamp}.pkl")
+        model_tag = "lw" if lightweight_mode else "full"
+        model_path = os.path.join("saved_models", f"model_{model_timestamp}_{model_tag}.pkl")
         model_bundle = {
             "metadata": {
                 "trained_at": model_timestamp,
@@ -95,6 +112,8 @@ def main():
                 "holdout_end": config.HOLDOUT_END,
                 "features_count": all_features.shape[1],
                 "assets_count": len([c for c in clean_data.columns if "_volume" not in c]),
+                "lightweight": lightweight_mode,
+                "ga_params": ga_params,
             },
             "regime_models": regime_models,
         }
@@ -121,17 +140,109 @@ def main():
             skip_retraining=skip_retraining,
             initial_models=regime_models if skip_retraining else None,
             collect_predictions=True,
+            ga_params=ga_params if not skip_retraining else None,
         )
         pbar.update(1)
         
         if "error" not in backtest_results:
-            print(f"\nBacktest Performance (OOS):")
-            print(f"  Annualized Return: {backtest_results['annualized_return']:.2%}")
-            print(f"  Sharpe Ratio: {backtest_results['sharpe_ratio']:.2f}")
-            print(f"  Max Drawdown: {backtest_results['max_drawdown']:.2%}")
+            print(f"\nOUT-OF-SAMPLE PERFORMANCE (HOLD-OUT: {config.HOLDOUT_START} to {config.HOLDOUT_END})")
+            print(f"="*50)
+            print(f"Annualized Return:    {backtest_results['annualized_return']:>10.2%}")
+            print(f"Annualized Vol:      {backtest_results['annualized_vol']:>10.2%}")
+            print(f"Sharpe Ratio:        {backtest_results['sharpe_ratio']:>10.2f}")
+            print(f"Max Drawdown:        {backtest_results['max_drawdown']:>10.2%}")
+            
+            avg_exp = backtest_results.get('weights_history', pd.DataFrame())
+            if 'exposure' in avg_exp.columns:
+                print(f"Avg Portfolio Exp:   {avg_exp['exposure'].mean():>10.2%}")
+            
+            print(f"Selection Alpha:     {backtest_results.get('selection_alpha', 0):>10.2%}")
+            print(f"Execution Alpha:     {backtest_results.get('vol_targeting_impact', 0):>10.2%} (Risk Mgmt Boost)")
+            print(f"Model Hit Rate:      {backtest_results.get('hit_rate', 0):>10.2%} (vs SPY)")
+            
+            print(f"\nTRADE ANALYTICS (HOLDOUT PERIOD):")
+            print("-" * 50)
+            trade_df = backtest_results.get('trade_log', pd.DataFrame())
+            if not trade_df.empty:
+                wins = trade_df[trade_df['return'] > 0]['return']
+                losses = trade_df[trade_df['return'] <= 0]['return']
+                print(f"  Total Trades:      {len(trade_df)}")
+                print(f"  Win Rate:          {len(wins)/len(trade_df):>10.2%}")
+                print(f"  Avg Win:           {wins.mean():>10.2%}")
+                print(f"  Avg Loss:          {losses.mean():>10.2%}")
+                p_sum = wins.sum()
+                l_sum = abs(losses.sum())
+                profit_factor = p_sum / l_sum if l_sum > 0 else 0
+                print(f"  Profit Factor:     {profit_factor:>10.2f}")
+                
+                print(f"\nSECTOR ALPHA BREAKDOWN (WHICH MACRO THEMES ARE WORKING?):")
+                print("-" * 50)
+                sector_stats = trade_df.groupby('sector')['return'].agg(['sum', 'count'])
+                sector_stats = sector_stats.sort_values('sum', ascending=False)
+                for sector, row in sector_stats.iterrows():
+                    print(f"  {sector:<15}: {row['sum']:>8.2%} ({int(row['count'])} trades)")
+
+            print(f"\nGA EVOLUTION METRICS:")
+            print("-"*50)
+            print(f"  Final Gen Best IC: {backtest_results.get('ga_best_ic', 0):.4f}")
+            
+            quality = backtest_results.get("model_quality", {})
+            if quality:
+                print(f"\nMODEL QUALITY (OUTPERFORMANCE FOCUS):")
+                print("-"*50)
+                print(f"  Decile Spread:     {quality.get('decile_spread', 0):>10.4%} (Top decile - Bottom decile)")
+                print(f"  Long/Short:        {quality.get('long_short', 0):>10.4%} (Top 10% - Bottom 10%)")
+                print(f"  Top-N Alpha:       {quality.get('top_n_alpha', 0):>10.4%} (Selected - Unselected)")
+
+            # Execution comparison table
+            shadow_stats = backtest_results.get("shadow_stats", {})
+            model_only_stats = backtest_results.get("model_only_stats", {})
+            if shadow_stats or model_only_stats:
+                print(f"\nEXECUTION COMPARISON (ANNUALIZED):")
+                print("-"*50)
+                print(f"  Executed  | Ret: {backtest_results['annualized_return']:>7.2%} | Vol: {backtest_results['annualized_vol']:>7.2%} | Sharpe: {backtest_results['sharpe_ratio']:>5.2f}")
+                if shadow_stats:
+                    print(f"  Shadow    | Ret: {shadow_stats.get('annualized_return', 0):>7.2%} | Vol: {shadow_stats.get('annualized_vol', 0):>7.2%} | Sharpe: {shadow_stats.get('sharpe_ratio', 0):>5.2f}")
+                if model_only_stats:
+                    print(f"  ModelOnly | Ret: {model_only_stats.get('annualized_return', 0):>7.2%} | Vol: {model_only_stats.get('annualized_vol', 0):>7.2%} | Sharpe: {model_only_stats.get('sharpe_ratio', 0):>5.2f}")
+            
+            print(f"\nTOP 15 ALPHA-POSITIVE TICKERS:")
+            print("-"*50)
+            asset_stats = backtest_results.get('asset_stats')
+            if isinstance(asset_stats, pd.DataFrame) and not asset_stats.empty:
+                top_perf = asset_stats.sort_values('sum', ascending=False).head(15)
+                for ticker, row in top_perf.iterrows():
+                    print(f"  {ticker:<10}: {row['sum']:>8.2%}")
+            
+            print(f"\nTOP 10 NEGATIVE ALPHA TICKERS (DETRACTORS):")
+            print("-"*50)
+            if isinstance(asset_stats, pd.DataFrame) and not asset_stats.empty:
+                bot_perf = asset_stats.sort_values('sum', ascending=True).head(10)
+                for ticker, row in bot_perf.iterrows():
+                    print(f"  {ticker:<10}: {row['sum']:>8.2%}")
+            
+            print(f"\nCURRENT LIVE RECOMMENDATIONS (LATEST REBALANCE):")
+            print("-"*50)
+            holdings = backtest_results.get('current_holdings', {})
+            if holdings:
+                sorted_h = sorted(holdings.items(), key=lambda x: x[1], reverse=True)
+                for ticker, weight in sorted_h:
+                    if weight > 0.001:
+                        print(f"  {ticker:<10}: {weight:>8.2%}")
+            
+            print(f"\nFEATURE ALPHA LOADINGS (DIRECTIONAL PREDICTIVE POWER):")
+            print("-"*50)
+            loadings = pd.Series(backtest_results.get('feature_loadings', {}))
+            if not loadings.empty:
+                top_features = loadings.abs().sort_values(ascending=False).head(12)
+                for feat, _ in top_features.items():
+                    direction = "bullish" if loadings[feat] > 0 else "bearish"
+                    print(f"  {feat:<25}: {loadings[feat]:>8.4f} ({direction})")
+            print("="*50 + "\n")
 
         # Save predictions bundle for Phase 2 execution testing
         pred_tag = "wf-skip" if skip_retraining else "wf-retrain"
+        pred_tag = f"{pred_tag}_{model_tag}"
         pred_timestamp = time.strftime("%Y%m%d_%H%M%S")
         os.makedirs("saved_models", exist_ok=True)
         predictions = backtest_results.get("predictions") if isinstance(backtest_results, dict) else None
@@ -153,6 +264,8 @@ def main():
                             "top_n_default": 8,
                             "walkforward_retrain": not skip_retraining,
                             "source": "run.py",
+                            "lightweight": lightweight_mode,
+                            "ga_params": ga_params,
                         },
                         "predictions": predictions,
                         "asset_cols": asset_cols,

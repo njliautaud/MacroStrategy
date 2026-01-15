@@ -25,9 +25,11 @@ def select_prediction_file():
             with open(path, "rb") as f:
                 data = pickle.load(f)
             meta = data.get("metadata", {})
-            # Determine retrain status for display
+            # Determine retrain and lightweight status for display
             wf_retrain = meta.get("walkforward_retrain")
             retrain_status = "Retrained" if wf_retrain is True else ("Static" if wf_retrain is False else "Unknown")
+            light_flag = meta.get("lightweight")
+            light_status = "Lightweight" if light_flag is True else ("Full" if light_flag is False else "Unknown")
             
             models.append(
                 {
@@ -36,6 +38,7 @@ def select_prediction_file():
                     "train_end": meta.get("train_end", ""),
                     "holdout_end": meta.get("holdout_end", ""),
                     "retrain_status": retrain_status,
+                    "light_status": light_status,
                 }
             )
         except Exception:
@@ -52,7 +55,7 @@ def select_prediction_file():
 
     listbox = tk.Listbox(root, width=120, height=10)
     for idx, m in enumerate(models):
-        display_text = f"[{m['retrain_status']}] {m['trained_at']} | train_end={m['train_end']} | holdout_end={m['holdout_end']} | {os.path.basename(m['path'])}"
+        display_text = f"[{m['retrain_status']}] [{m['light_status']}] {m['trained_at']} | train_end={m['train_end']} | holdout_end={m['holdout_end']} | {os.path.basename(m['path'])}"
         listbox.insert(idx, display_text)
     listbox.select_set(0)
     listbox.pack(padx=10, pady=5)

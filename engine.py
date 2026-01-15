@@ -7,7 +7,7 @@ import math
 import multiprocessing
 from tqdm import tqdm
 from statsmodels.tsa.stattools import grangercausalitytests
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from deap import base, creator, tools, algorithms, gp
 from hmmlearn import hmm
 from scipy.stats import ttest_1samp, spearmanr
@@ -83,6 +83,17 @@ class FeatureEngineer:
         features = {}
         
         ticker_to_sector = {}
+        sector_etf_map = {
+            "tech": "XLK",
+            "financials": "XLF",
+            "energy": "XLE",
+            "industrials": "XLI",
+            "healthcare": "XLV",
+            "consumer": "XLP",
+            "materials": "XLB",
+            "utilities": "XLU",
+            "real_estate": "XLRE",
+        }
         sector_to_tickers = {}
         for category, sectors in config.ASSET_UNIVERSE.items():
             if category == "macro_indicators": continue
@@ -104,11 +115,12 @@ class FeatureEngineer:
         print(f"  Engineering decision features for {len(valid_cols)} assets...")
         for col in tqdm(valid_cols, desc="Feature Engineering", unit="asset"):
             col_series = df[col]
-            vol_col = f"{col}_volume"
+            base_ticker = col.replace("_close", "") if col.endswith("_close") else col
+            vol_col = f"{base_ticker}_volume"
             vol_series = df[vol_col] if vol_col in df.columns else None
             # If futures volume is missing/unreliable, try a liquid proxy ETF volume
-            if vol_series is None and col in config.COMMODITY_FLOW_PROXY:
-                proxy = config.COMMODITY_FLOW_PROXY[col]
+            if vol_series is None and base_ticker in config.COMMODITY_FLOW_PROXY:
+                proxy = config.COMMODITY_FLOW_PROXY[base_ticker]
                 proxy_vol = f"{proxy}_volume"
                 if proxy_vol in df.columns:
                     vol_series = df[proxy_vol]
@@ -127,9 +139,9 @@ class FeatureEngineer:
             # 3. ATR RATIO (Volatility proxy)
             features[f"{col}_atr_ratio"] = returns.abs().rolling(14).mean() / (returns.abs().rolling(63).mean() + 1e-9)
             # True ATR (if OHLC present)
-            hi = df[f"{col}_high"] if f"{col}_high" in df.columns else None
-            lo = df[f"{col}_low"] if f"{col}_low" in df.columns else None
-            op = df[f"{col}_open"] if f"{col}_open" in df.columns else None
+            hi = df[f"{base_ticker}_high"] if f"{base_ticker}_high" in df.columns else None
+            lo = df[f"{base_ticker}_low"] if f"{base_ticker}_low" in df.columns else None
+            op = df[f"{base_ticker}_open"] if f"{base_ticker}_open" in df.columns else None
             if hi is not None and lo is not None:
                 prev_close = col_series.shift(1)
                 tr = pd.concat([(hi - lo).abs(), (hi - prev_close).abs(), (lo - prev_close).abs()], axis=1).max(axis=1)
@@ -145,23 +157,24 @@ class FeatureEngineer:
             else:
                 features[f"{col}_gap_pct"] = 0
             # VWAP deviation (close vs vwap)
-            if f"{col}_vwap" in df.columns:
-                vwap = df[f"{col}_vwap"]
+            if f"{base_ticker}_vwap" in df.columns:
+                vwap = df[f"{base_ticker}_vwap"]
                 features[f"{col}_vwap_dev"] = ((col_series - vwap) / (vwap + 1e-9)).fillna(0)
             else:
                 features[f"{col}_vwap_dev"] = 0
 
             # 4. RELATIVE STRENGTH INDEX (Ticker vs Sector)
-            sector = ticker_to_sector.get(col)
-            if sector and sector in df.columns:
-                features[f"{col}_rel_strength_idx"] = col_series.pct_change(21) / (df[sector].pct_change(21) + 1e-9)
+            sector = ticker_to_sector.get(base_ticker)
+            sector_etf = sector_etf_map.get(sector) if sector else None
+            if sector_etf and sector_etf in df.columns:
+                features[f"{col}_rel_strength_idx"] = col_series.pct_change(21) / (df[sector_etf].pct_change(21) + 1e-9)
             else:
                 features[f"{col}_rel_strength_idx"] = 1.0
 
             # 5. SECTOR ROTATION DRIFT (Momentum relative to ALL other sectors)
             sector_etfs = config.ASSET_UNIVERSE["etfs"]["sector"]
-            if sector and sector in df.columns:
-                sector_mom = df[sector].pct_change(21)
+            if sector_etf and sector_etf in df.columns:
+                sector_mom = df[sector_etf].pct_change(21)
                 valid_etfs = [e for e in sector_etfs if e in df.columns]
                 avg_market_mom = df[valid_etfs].pct_change(21).mean(axis=1) if valid_etfs else 0
                 features[f"{col}_sector_rotation_drift"] = sector_mom - avg_market_mom
@@ -171,7 +184,7 @@ class FeatureEngineer:
             # 6. 2nd ORDER COMMODITY DRAG (Cost pressure propagation)
             # Link industrial/tech assets to energy/metals spikes
             commodity_drag = 0
-            if col in config.ASSET_UNIVERSE["equities"]["tech"] or col in config.ASSET_UNIVERSE["equities"]["industrials"]:
+            if base_ticker in config.ASSET_UNIVERSE["equities"]["tech"] or base_ticker in config.ASSET_UNIVERSE["equities"]["industrials"]:
                 # Energy and Industrial Metals as cost inputs
                 inputs = ["CL=F", "HG=F", "PA=F"]
                 for inp in inputs:
@@ -276,26 +289,31 @@ class FeatureEngineer:
         # Futures commodity groups
         for grp, tickers in config.ASSET_UNIVERSE.get("commodities_futures", {}).items():
             sector_to_tickers[f"cmd_{grp}"] = tickers
-        # Proxy commodity groups (metals/energy/agri/broad etc.)
-        for grp, tickers in getattr(config, "COMMODITY_PROXY_GROUPS", {}).items():
-            sector_to_tickers[f"proxy_{grp}"] = tickers
 
         macro_ids = [sid for sub in config.ASSET_UNIVERSE["macro_indicators"].values() for sid in sub]
         net_flows = {}
-        for col in df.columns:
-            if col in macro_ids or "_volume" in col: continue
-            vol_col = f"{col}_volume"
+        
+        # Determine actual price columns (ones we have returns for)
+        price_cols = [c for c in df.columns if c not in macro_ids and "_volume" not in c and not c.endswith(("_open", "_high", "_low", "_vwap"))]
+        
+        for col in price_cols:
+            ticker = col.replace("_close", "")
+            # Look for volume in SYMBOL_volume or SYMBOL_volume_close etc.
+            vol_col = f"{ticker}_volume"
             if vol_col in df.columns:
                 returns = df[col].pct_change()
-                flow = np.sign(returns) * df[vol_col]
+                # Use a simpler flow proxy: Price change * volume
+                flow = returns * df[vol_col]
+                # Normalize by rolling average volume to get "Flow Intensity"
                 norm_flow = flow / (df[vol_col].rolling(252).mean() + 1e-9)
-                net_flows[col] = norm_flow.rolling(21).mean()
+                net_flows[ticker] = norm_flow.rolling(21).mean()
 
         group_flow_df = pd.DataFrame()
         for grp, tickers in sector_to_tickers.items():
             valid = [t for t in tickers if t in net_flows]
             if valid:
                 group_flow_df[grp] = pd.concat([net_flows[t] for t in valid], axis=1).mean(axis=1)
+        
         return {"group_flows": group_flow_df.fillna(0)}
 
 def protected_div(left, right):
@@ -303,6 +321,12 @@ def protected_div(left, right):
 
 def protected_log(x):
     return math.log(abs(x) + 1e-9)
+
+def protected_exp(x):
+    try:
+        return math.exp(max(min(x, 10), -10))
+    except Exception:
+        return 1.0
 
 def protected_sqrt(x):
     return math.sqrt(abs(x))
@@ -330,7 +354,9 @@ def evaluate_symbolic(individual, pset, X, y):
     """Top-level evaluation function for Symbolic GA (Picklable)."""
     func = gp.compile(expr=individual, pset=pset)
     try:
-        preds = np.array([func(*record) for record in X])
+        preds = np.array([func(*record) for record in X], dtype=float)
+        preds = np.nan_to_num(preds, nan=0.0, posinf=1e6, neginf=-1e6)
+        preds = np.clip(preds, -1e6, 1e6)
         if np.std(preds) < 1e-9: return (0.0,)
         corr, _ = spearmanr(preds, y)
         return (corr if np.isfinite(corr) else 0.0,)
@@ -341,7 +367,9 @@ def evaluate_execution(individual, pset, X, y):
     """Top-level evaluation function for Execution GA (Picklable)."""
     func = gp.compile(expr=individual, pset=pset)
     try:
-        scores = np.array([func(*record) for record in X])
+        scores = np.array([func(*record) for record in X], dtype=float)
+        scores = np.nan_to_num(scores, nan=0.0, posinf=1e6, neginf=-1e6)
+        scores = np.clip(scores, -1e6, 1e6)
         if np.std(scores) < 1e-9: return (0.0,)
         corr, _ = spearmanr(scores, -y) 
         return (corr if np.isfinite(corr) else 0.0,)
@@ -370,7 +398,7 @@ class SymbolicOptimizer:
         self.pset.addPrimitive(relu, 1)
         self.pset.addPrimitive(protected_log, 1, name="log")
         self.pset.addPrimitive(protected_sqrt, 1, name="sqrt")
-        self.pset.addPrimitive(math.exp, 1)
+        self.pset.addPrimitive(protected_exp, 1, name="exp")
         self.pset.addPrimitive(abs, 1, name="abs")
         
         # Cyclical & Seasonal Primitives (Captures rotation cycles)
@@ -448,36 +476,57 @@ class SymbolicOptimizer:
         return hof[0]
 
 class RegimeAwareGeneticOptimizer:
-    def __init__(self, prices_df, feature_df, regimes):
+    def __init__(self, prices_df, feature_df, regimes, n_gen=100, pop_size=1500, max_depth=7):
         self.prices_df = prices_df
         self.feature_df = feature_df
         self.regimes = regimes
         self.regime_models = {}
+        self.n_gen = n_gen
+        self.pop_size = pop_size
+        self.max_depth = max_depth
 
     def optimize(self):
         unique_regimes = self.regimes.unique()
         for r in unique_regimes:
-            print(f"  Evolving Alpha Formula (Unified Discovery, Depth=7, Pop=1500)..." if len(unique_regimes) == 1 else f"  Evolving Alpha Formula for Regime {r} (Advanced GA, Depth=7, Pop=1500)...")
+            print(
+                f"  Evolving Alpha Formula (Unified Discovery, Depth={self.max_depth}, Pop={self.pop_size})..."
+                if len(unique_regimes) == 1
+                else f"  Evolving Alpha Formula for Regime {r} (Advanced GA, Depth={self.max_depth}, Pop={self.pop_size})..."
+            )
             r_dates = self.regimes[self.regimes == r].index
             if len(r_dates) < 50: continue
             
             tickers = list(set([c.split('_')[0] for c in self.feature_df.columns if '_' in c]))
+            # Filter out assets with excessive outlier returns (likely bad data/splits)
+            try:
+                ret_df = self.prices_df[tickers].pct_change()
+                extreme_rate = (ret_df.abs() > 0.5).mean()
+                bad_assets = set(extreme_rate[extreme_rate > 0.01].index)
+                tickers = [t for t in tickers if t not in bad_assets]
+            except Exception:
+                pass
             X_data = []
             y_data = []
             
-            # Use a larger sample for the unified model to capture cross-asset patterns better
-            sample_count = 500 if len(unique_regimes) == 1 else 300
-            sample_dates = r_dates[-sample_count:] if len(r_dates) > sample_count else r_dates
+            # Use a representative sample across the ENTIRE training history, not just the end
+            sample_count = 800 if len(unique_regimes) == 1 else 400
+            if len(r_dates) > sample_count:
+                # Randomly sample across history to capture different market regimes (growth, value, crash)
+                sample_indices = np.linspace(0, len(r_dates)-1, sample_count).astype(int)
+                sample_dates = r_dates[sample_indices]
+            else:
+                sample_dates = r_dates
+            
             spy_col = "SPY_close" if "SPY_close" in self.prices_df.columns else "SPY"
-            market_return = self.prices_df[spy_col].pct_change(21).shift(-21) if spy_col in self.prices_df.columns else 0
+            market_return = self.prices_df[spy_col].pct_change(21).shift(-21) if spy_col in self.prices_df.columns else None
             
             for date in sample_dates:
-                # Pick a subset of tickers for each date to avoid overfitting to one stock
+                # Pick a more diverse subset of tickers to avoid sector bias
                 valid_tickers = [t for t in tickers if t in self.prices_df.columns]
-                if not valid_tickers:
-                    continue
-                # Pick more tickers for unified model to see more relationships
-                pick_n = min(len(valid_tickers), 35 if len(unique_regimes) == 1 else 25)
+                if not valid_tickers: continue
+                
+                # Pick enough tickers to see real relationships
+                pick_n = min(len(valid_tickers), 50 if len(unique_regimes) == 1 else 30)
                 for t in np.random.choice(valid_tickers, pick_n, replace=False):
                     feat_vec = []
                     for f in config.FEATURE_SET:
@@ -487,24 +536,40 @@ class RegimeAwareGeneticOptimizer:
                     
                     # TARGET: Individual Asset Alpha (Excess Return over Market)
                     asset_ret = self.prices_df[t].pct_change(21).shift(-21).asof(date)
-                    mkt_ret = market_return.asof(date) if isinstance(market_return, pd.Series) else 0
+                    mkt_ret = market_return.asof(date) if market_return is not None else 0
                     
                     if np.isfinite(asset_ret) and np.isfinite(mkt_ret):
+                        # Shape target to prioritize higher positive alpha without changing exposure caps
+                        alpha_raw = asset_ret - mkt_ret
+                        alpha_clip = getattr(config, "ALPHA_CLIP", 0.5)
+                        pos_bonus = getattr(config, "ALPHA_POS_BONUS", 2.0)
+                        alpha = np.clip(alpha_raw, -alpha_clip, alpha_clip)
+                        target = alpha + pos_bonus * np.maximum(alpha, 0) ** 2
+                        
                         X_data.append(feat_vec)
-                        y_data.append(asset_ret - mkt_ret)
+                        y_data.append(target)
 
             if not X_data: continue
             X_np = np.nan_to_num(np.array(X_data))
             y_np = np.nan_to_num(np.array(y_data))
             
+            # Normalize features to prevent scale dominance and overflow during GP
+            scaler = RobustScaler()
+            X_np = scaler.fit_transform(X_np)
+            X_np = np.clip(X_np, -5, 5)
+            
             # Deep search: Larger population, more generations, deeper trees
             sym = SymbolicOptimizer(
-                n_features=len(config.FEATURE_SET), 
-                n_gen=100,      # Increased for better convergence
-                pop_size=1500,   # Increased for more diversity
-                max_depth=7      # Increased for capturing higher-order effects
+                n_features=len(config.FEATURE_SET),
+                n_gen=self.n_gen,
+                pop_size=self.pop_size,
+                max_depth=self.max_depth
             )
-            self.regime_models[r] = {"formula": sym.fit(X_np, y_np), "pset": sym.pset}
+            self.regime_models[r] = {
+                "formula": sym.fit(X_np, y_np),
+                "pset": sym.pset,
+                "scaler": scaler
+            }
         return self.regime_models
 
 class CausalEngine:
@@ -650,7 +715,14 @@ class Backtester:
         prices_df = prices_df[~prices_df.index.duplicated()]
         macro_ids = [sid for sub in config.ASSET_UNIVERSE["macro_indicators"].values() for sid in sub]
         asset_cols = [c for c in prices_df.columns if c not in macro_ids and "_volume" not in c]
-        returns_df = prices_df[asset_cols].pct_change().dropna()
+        returns_df = prices_df[asset_cols].pct_change()
+        # Drop assets with frequent extreme moves (likely bad data/splits)
+        extreme_rate = (returns_df.abs() > 0.5).mean()
+        bad_assets = extreme_rate[extreme_rate > 0.01].index
+        if len(bad_assets) > 0:
+            returns_df = returns_df.drop(columns=list(bad_assets))
+            asset_cols = [c for c in asset_cols if c not in bad_assets]
+        returns_df = returns_df.clip(-0.5, 0.5).dropna()
         
         # EXECUTION PARAMETERS
         TARGET_VOL = 0.15  # 15% Annualized Vol Target
@@ -848,7 +920,8 @@ class Backtester:
         is_placebo=False,
         skip_retraining=False,
         initial_models=None,
-        collect_predictions=False
+        collect_predictions=False,
+        ga_params=None
     ):
         """
         Expanding walk-forward:
@@ -864,6 +937,9 @@ class Backtester:
             c for c in prices_df.columns
             if c not in macro_ids and "_volume" not in c and not c.endswith(("_open", "_high", "_low", "_vwap"))
         ]
+        # EXCLUDE Cash Proxies from selection universe to prevent "Defensive Flattening"
+        asset_cols = [c for c in asset_cols if c.replace("_close", "") not in ["SHV", "BIL", "SHY", "TLT", "LQD", "IEF"]]
+        
         returns_df = prices_df[asset_cols].pct_change().dropna()
 
         # CONFIG & PARAMS
@@ -876,6 +952,13 @@ class Backtester:
         portfolio_returns = []; model_only_returns = []; no_vol_returns = []
         weight_history = []; trades = []; ic_samples = {f: [] for f in config.FEATURE_SET}
         predictions_log = {} if collect_predictions else None
+        
+        # Model quality metrics (beyond IC)
+        quality_metrics = {
+            "decile_spread": [],
+            "long_short": [],
+            "top_n_alpha": [],
+        }
         
         # Dual-Model State
         current_models = None; exit_model = None; last_retrain = None
@@ -901,7 +984,17 @@ class Backtester:
                 # We use all historical data for a single robust formula
                 regimes = pd.Series(0, index=hist_prices.index)
                 
-                pred_optimizer = RegimeAwareGeneticOptimizer(hist_prices, hist_features, regimes)
+                if ga_params is None:
+                    pred_optimizer = RegimeAwareGeneticOptimizer(hist_prices, hist_features, regimes)
+                else:
+                    pred_optimizer = RegimeAwareGeneticOptimizer(
+                        hist_prices,
+                        hist_features,
+                        regimes,
+                        n_gen=ga_params.get("n_gen", 100),
+                        pop_size=ga_params.get("pop_size", 1500),
+                        max_depth=ga_params.get("max_depth", 7),
+                    )
                 current_models = pred_optimizer.optimize()
                 
                 # 2. RETRAIN EXECUTION ENGINE (Learn from past trade outcomes)
@@ -922,10 +1015,15 @@ class Backtester:
             current_regime = regimes.asof(start) if 'regimes' in locals() else 0
             model_data = current_models.get(current_regime, next(iter(current_models.values())))
             func = gp.compile(model_data["formula"], model_data["pset"])
+            scaler = model_data.get("scaler")
             
             scores = {}
             for t in asset_cols:
-                input_vec = [feature_df[f"{t}_{f}"].asof(start) if f"{t}_{f}" in feature_df.columns else 0 for f in config.FEATURE_SET]
+                raw_vec = [feature_df[f"{t}_{f}"].asof(start) if f"{t}_{f}" in feature_df.columns else 0 for f in config.FEATURE_SET]
+                input_vec = raw_vec
+                if scaler is not None:
+                    input_vec = scaler.transform([raw_vec])[0]
+                    input_vec = np.clip(input_vec, -5, 5)
                 try: 
                     s = func(*input_vec)
                     scores[t] = s if np.isfinite(s) else 0.0
@@ -957,6 +1055,49 @@ class Backtester:
             daily_port_rets = []; daily_no_vol_rets = []; daily_model_only = []
             
             asset_vols = hist_subset.std()
+            
+            # --- MODEL QUALITY METRICS (Decile Spread, Long/Short, Top-N Alpha) ---
+            try:
+                spy_col = "SPY_close" if "SPY_close" in prices_df.columns else "SPY"
+                bench_period = (1 + prices_df.loc[mask, spy_col].pct_change().fillna(0)).prod() - 1
+                period_alpha = (1 + returns_df.loc[mask, asset_cols].fillna(0)).prod() - 1
+                period_alpha = (period_alpha - bench_period).dropna()
+                
+                score_series = pd.Series(scores)
+                aligned_alpha = period_alpha.reindex(score_series.index).dropna()
+                aligned_scores = score_series.reindex(aligned_alpha.index).dropna()
+                
+                if len(aligned_scores) >= 20:
+                    # Decile spread
+                    deciles = pd.qcut(aligned_scores, q=10, labels=False, duplicates="drop")
+                    if deciles.nunique() >= 2:
+                        top_decile_ret = aligned_alpha[deciles == deciles.max()].mean()
+                        bot_decile_ret = aligned_alpha[deciles == deciles.min()].mean()
+                        quality_metrics["decile_spread"].append(float(top_decile_ret - bot_decile_ret))
+                    
+                    # Long/Short (top 10% minus bottom 10%)
+                    top_n = max(1, int(len(aligned_scores) * 0.1))
+                    top_assets = aligned_scores.nlargest(top_n).index
+                    bot_assets = aligned_scores.nsmallest(top_n).index
+                    long_short = aligned_alpha.reindex(top_assets).mean() - aligned_alpha.reindex(bot_assets).mean()
+                    quality_metrics["long_short"].append(float(long_short))
+                    
+                    # Top-N selection alpha (selected vs unselected)
+                    selected_alpha = aligned_alpha.reindex(selected).mean() if selected else 0.0
+                    unselected_alpha = aligned_alpha.drop(selected, errors="ignore").mean()
+                    quality_metrics["top_n_alpha"].append(float(selected_alpha - unselected_alpha))
+            except Exception:
+                pass
+            
+            # Simple Execution State
+            cum_rets = {t: 0.0 for t in selected}
+            peak_rets = {t: 0.0 for t in selected}
+            exited = {t: False for t in selected}
+            
+            # Simple Execution Params
+            TRAIL_START = 0.08  # Start trailing stop after 8% gain
+            TRAIL_GAP = 0.05    # Exit if 5% drop from peak
+            
             for dt, row in period_returns.iterrows():
                 # 1. Model-Only (Equal Weight, No Stops, Raw Prediction)
                 daily_model_only.append(row.mean())
@@ -964,19 +1105,52 @@ class Backtester:
                 # 2. No-Vol Shadow (HRP Weights, but no scaling or exits)
                 daily_no_vol_rets.append((row * no_vol_weights).sum())
                 
-                # 3. Executed (Vol Targeting + Daily Stop Management)
+                # 3. Executed (Vol Targeting + SIMPLE Robust Exits)
                 active_weights = final_weights.copy()
                 stop_mult = STOP_LOSS_MULT * (0.7 if current_regime == 2 else 1.0)
+                
                 for t in selected:
-                    if row[t] < -(asset_vols[t] * stop_mult): active_weights[t] = 0
+                    if exited[t]:
+                        active_weights[t] = 0.0
+                        continue
+                        
+                    # Update returns
+                    cum_rets[t] = (1 + cum_rets[t]) * (1 + row[t]) - 1
+                    peak_rets[t] = max(peak_rets[t], cum_rets[t])
+                    
+                    # A. Simple Stop Loss (Standard Deviation based)
+                    if row[t] < -(asset_vols[t] * stop_mult):
+                        exited[t] = True
+                        active_weights[t] = 0.0
+                        continue
+                        
+                    # B. Simple Trailing Stop
+                    if peak_rets[t] >= TRAIL_START:
+                        if cum_rets[t] <= (peak_rets[t] - TRAIL_GAP):
+                            exited[t] = True
+                            active_weights[t] = 0.0
+                            continue
+                            
                 daily_port_rets.append((row * active_weights).sum())
 
             portfolio_returns.append(pd.Series(daily_port_rets, index=period_returns.index))
             no_vol_returns.append(pd.Series(daily_no_vol_rets, index=period_returns.index))
             model_only_returns.append(pd.Series(daily_model_only, index=period_returns.index))
             
+            # --- POPULATE TRADES FOR ANALYTICS ---
+            for t in selected:
+                # Total return for this rebalance period for this asset
+                asset_period_ret = (1 + period_returns[t]).prod() - 1
+                trades.append({
+                    'date': start, 
+                    'ticker': t, 
+                    'sector': ticker_to_sector.get(t, 'unknown'), 
+                    'return': asset_period_ret
+                })
+
             last_final_weights = final_weights.to_dict()
             cur_w = {s: 0.0 for s in set(ticker_to_sector.values())}; cur_w["date"] = start
+            cur_w["exposure"] = float(final_weights.sum()) # Capture avg exposure
             for t, w in final_weights.items(): cur_w[ticker_to_sector.get(t, "unknown")] += float(w)
             weight_history.append(cur_w)
 
@@ -984,18 +1158,37 @@ class Backtester:
             try:
                 spy_col = "SPY_close" if "SPY_close" in prices_df.columns else "SPY"
                 bench_period = (1 + prices_df.loc[mask, spy_col].pct_change().fillna(0)).prod() - 1
-                asset_rets_period = (1 + returns_df.loc[mask, asset_cols]).prod() - 1
-                asset_alpha_period = (asset_rets_period - bench_period).replace([np.inf, -np.inf], np.nan).dropna()
-                if len(asset_alpha_period) >= 10:
+                
+                # USE ALL ASSETS for IC calculation to see true predictive power across universe
+                universe_rets = (1 + returns_df.loc[mask, asset_cols].fillna(0)).prod() - 1
+                universe_alpha = (universe_rets - bench_period).dropna()
+                
+                if len(universe_alpha) >= 10:
                     for f in config.FEATURE_SET:
-                        feat_vals = {a: feature_df[f"{a}_{f}"].asof(start) for a in asset_alpha_period.index if f"{a}_{f}" in feature_df.columns}
+                        feat_vals = {}
+                        for a in universe_alpha.index:
+                            col_direct = f"{a}_{f}"
+                            ticker_clean = a.replace("_close", "")
+                            col_fallback = f"{ticker_clean}_{f}"
+                            if col_direct in feature_df.columns:
+                                val = feature_df[col_direct].asof(start)
+                            elif col_fallback in feature_df.columns:
+                                val = feature_df[col_fallback].asof(start)
+                            else:
+                                val = np.nan
+                            if np.isfinite(val):
+                                feat_vals[a] = val
+                        
                         if len(feat_vals) >= 10:
-                            x_ic = pd.Series(feat_vals).replace([np.inf, -np.inf], np.nan).dropna()
-                            y_ic = asset_alpha_period.reindex(x_ic.index).dropna()
-                            if len(x_ic) >= 10 and y_ic.std() > 1e-12:
+                            x_ic = pd.Series(feat_vals).dropna()
+                            y_ic = universe_alpha.reindex(x_ic.index).dropna()
+                            
+                            if len(x_ic) >= 10 and x_ic.std() > 1e-12 and y_ic.std() > 1e-12:
                                 ic_val, _ = spearmanr(x_ic.values, y_ic.values, nan_policy="omit")
-                                if np.isfinite(ic_val): ic_samples[f].append(float(ic_val))
-            except: pass
+                                if np.isfinite(ic_val): 
+                                    ic_samples[f].append(float(ic_val))
+            except Exception:
+                pass
 
         if not portfolio_returns: return {"error": "Insufficient data"}
         
@@ -1004,33 +1197,86 @@ class Backtester:
         all_nv_ret = pd.concat(no_vol_returns).sort_index(); all_nv_ret = all_nv_ret[~all_nv_ret.index.duplicated()]
         all_mo_ret = pd.concat(model_only_returns).sort_index(); all_mo_ret = all_mo_ret[~all_mo_ret.index.duplicated()]
         
+        # Cap returns to avoid data error explosions (max 50% daily)
+        all_p_ret = all_p_ret.clip(-0.5, 0.5)
+        all_nv_ret = all_nv_ret.clip(-0.5, 0.5)
+        all_mo_ret = all_mo_ret.clip(-0.5, 0.5)
+
         cum_ret = (1 + all_p_ret).cumprod()
         cum_nv = (1 + all_nv_ret).cumprod()
         cum_mo = (1 + all_mo_ret).cumprod()
+        max_dd = (cum_ret / cum_ret.cummax() - 1).min()
         
         spy_col = "SPY_close" if "SPY_close" in prices_df.columns else "SPY"
         benchmark_returns = prices_df[spy_col].pct_change().reindex(all_p_ret.index).fillna(0)
         bench_cum = (1 + benchmark_returns).cumprod()
 
+        # --- CORRELATION MONITOR DATA ---
+        actual_cols = prices_df.columns.tolist()
+        comm = [t for sub in config.ASSET_UNIVERSE["commodities_futures"].values() for t in sub]
+        comm += [t for sub in config.ASSET_UNIVERSE["commodities_fmp"].values() for t in sub]
+        comm_proxy = config.ASSET_UNIVERSE["etfs"]["commodity_proxies"]
+        eq = [t for sub in config.ASSET_UNIVERSE["equities"].values() for t in sub]
+        
+        ordered = []
+        for t in (comm + comm_proxy + eq):
+            if t in actual_cols: ordered.append(t)
+            elif f"{t}_close" in actual_cols: ordered.append(f"{t}_close")
+        
+        corr_comm_eq = prices_df[ordered].corr() if ordered else pd.DataFrame()
+
         # --- DUAL-ENGINE ANALYTICS ---
         ann_r = all_p_ret.mean() * 252; ann_v = all_p_ret.std() * np.sqrt(252)
         ann_nv = all_nv_ret.mean() * 252; ann_mo = all_mo_ret.mean() * 252
+        ann_nv_v = all_nv_ret.std() * np.sqrt(252)
+        ann_mo_v = all_mo_ret.std() * np.sqrt(252)
         
         # Vol Targeting Impact: Executed Return - Shadow Return
         vol_impact = ann_r - ann_nv
         # Selection Alpha: Model-Only Return - Benchmark Return
         selection_alpha = ann_mo - (benchmark_returns.mean() * 252)
 
+        # Get the best IC from the unified model if available
+        ga_best_ic = 0.0
+        if isinstance(initial_models, dict) and initial_models:
+            # Look for the best fitness in the first model's formula
+            model_data = next(iter(initial_models.values()))
+            if "formula" in model_data and hasattr(model_data["formula"], "fitness"):
+                ga_best_ic = model_data["formula"].fitness.values[0]
+
+        trade_log = pd.DataFrame(trades) if trades else pd.DataFrame()
+        hit_rate = (trade_log['return'] > 0).mean() if not trade_log.empty else 0.0
+
         return {
             "cumulative_returns": cum_ret, "benchmark_returns": bench_cum,
             "shadow_returns_no_vol": cum_nv, "model_only_returns": cum_mo,
             "annualized_return": ann_r, "annualized_vol": ann_v, "sharpe_ratio": ann_r/(ann_v+1e-9),
+            "max_drawdown": max_dd,
             "vol_targeting_impact": vol_impact, "selection_alpha": selection_alpha,
             "feature_loadings": {f: (float(np.mean(v)) if len(v) else 0.0) for f, v in ic_samples.items()},
+            "shadow_stats": {
+                "annualized_return": ann_nv,
+                "annualized_vol": ann_nv_v,
+                "sharpe_ratio": ann_nv/(ann_nv_v+1e-9),
+            },
+            "model_only_stats": {
+                "annualized_return": ann_mo,
+                "annualized_vol": ann_mo_v,
+                "sharpe_ratio": ann_mo/(ann_mo_v+1e-9),
+            },
             "bench_stats": {"return": benchmark_returns.mean()*252, "vol": benchmark_returns.std()*np.sqrt(252)},
             "current_holdings": last_final_weights,
             "weights_history": pd.DataFrame(weight_history).set_index("date"),
-            "asset_stats": pd.DataFrame(trades).groupby('ticker')['return'].sum() if trades else pd.Series(),
+            "asset_stats": trade_log.groupby('ticker')['return'].agg(['sum', 'mean']).fillna(0) if not trade_log.empty else pd.Series(),
+            "trade_log": trade_log,
+            "correlation_comm_eq": corr_comm_eq,
+            "ga_best_ic": ga_best_ic,
+            "hit_rate": hit_rate,
+            "model_quality": {
+                "decile_spread": float(np.mean(quality_metrics["decile_spread"])) if quality_metrics["decile_spread"] else 0.0,
+                "long_short": float(np.mean(quality_metrics["long_short"])) if quality_metrics["long_short"] else 0.0,
+                "top_n_alpha": float(np.mean(quality_metrics["top_n_alpha"])) if quality_metrics["top_n_alpha"] else 0.0,
+            },
             "predictions": predictions_log if collect_predictions else None
         }
 

@@ -22,7 +22,8 @@ The Macro-Structural Alpha Engine is a data-driven system designed to capture fl
 The engine includes a **Walk-Forward Expanding Backtest** system with advanced validation:
 1.  **Run Analysis**: `python run.py` fetches data, evolves math formulas via Symbolic Regression, and simulates a walk-forward strategy.
     - The terminal will prompt whether to **skip retraining** during the holdout period for faster validation.
-    - It also saves a **Phase 2 predictions bundle** in `saved_models/` (filename includes `wf-retrain` or `wf-skip`).
+    - It also prompts for **lightweight mode** (smaller GA params for faster iteration).
+    - It saves a **Phase 2 predictions bundle** in `saved_models/` (filename includes `wf-retrain` or `wf-skip` and `lw`/`full`).
 2.  **Train + Save Model**: `python train_and_predict.py` trains on 2010-2022 and saves predictions for 2023-2025.
 3.  **Execution Testing**: `python test_execution.py` lets you select a saved model and compare execution methods side-by-side.
 4.  **Advanced GA Search**: Uses a large population (1000) and deep trees (6 branches) to discover non-linear alpha formulas using primitives like `sin`, `cos`, `log`, `exp`, `tanh`.

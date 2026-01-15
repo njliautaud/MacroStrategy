@@ -19,39 +19,88 @@ END_DATE = "2026-01-13"
 RETRAIN_EVERY_N_MONTHS = 3
 CACHE_DIR = "cache"
 
+# Alpha objective shaping (higher positive alpha gets extra weight)
+ALPHA_POS_BONUS = 2.0
+ALPHA_CLIP = 0.5
+
 # Expanded Asset Universe
 ASSET_UNIVERSE = {
     "equities": {
-        "tech": ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AVGO", "ORCL", "CRM", "ADBE", "AMD", "NFLX", "INTC", "CSCO", "QCOM", "TXN", "MU", "PANW", "SNOW", "AMAT", "LRCX", "KLAC"],
-        "financials": ["JPM", "GS", "BAC", "MS", "WFC", "V", "MA", "AXP", "BLK", "BX", "C", "PYPL", "SPGI", "SCHW", "CB", "MMC", "AON", "PGR", "MET", "PRU", "TROW"],
-        "energy": ["XOM", "CVX", "SLB", "COP", "MPC", "PSX", "VLO", "HES", "OXY", "HAL", "BKR", "KMI", "WMB", "DVN", "FANG", "EOG", "PXD", "CTRA"],
-        "industrials": ["CAT", "HON", "GE", "LMT", "BA", "UPS", "UNP", "DE", "RTX", "MMM", "GD", "FDX", "NSC", "EMR", "CP", "CNI", "WM", "RSG", "TT", "ETN"],
-        "healthcare": ["JNJ", "PFE", "UNH", "ABBV", "LLY", "MRK", "TMO", "DHR", "ISRG", "GILD", "BMY", "AMGN", "CVS", "SYK", "ZTS", "BDX", "BSX", "VRTX"],
-        "consumer": ["PG", "KO", "PEP", "COST", "WMT", "NKE", "MCD", "DIS", "HD", "LOW", "SBUX", "TJX", "EL", "CL", "MDLZ", "PM", "MO", "TGT", "DG"],
-        "materials": ["LIN", "APD", "SHW", "FCX", "NEM", "NUE", "ECL", "CTVA", "DOW", "DD", "ALB", "MLM", "VMC", "CF", "MOS"],
-        "utilities": ["NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "SRE", "WEC", "ES", "DTE", "FE", "ETR"],
-        "real_estate": ["PLD", "AMT", "CCI", "EQIX", "WY", "PSA", "DLR", "O", "VICI", "CBRE", "AVB", "EQR"],
+        "tech": [
+            "AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "TSLA", "AVGO", "ORCL", "CRM", "ADBE",
+            "AMD", "NFLX", "INTC", "CSCO", "QCOM", "TXN", "MU", "PANW", "SNOW", "AMAT", "LRCX", "KLAC",
+            # Mid-cap / high-growth tech
+            "NOW", "MDB", "DDOG", "NET", "CRWD", "ZS", "OKTA", "TEAM", "SHOP", "U", "SQ", "PLTR"
+        ],
+        "financials": [
+            "JPM", "GS", "BAC", "MS", "WFC", "V", "MA", "AXP", "BLK", "BX", "C", "PYPL", "SPGI", "SCHW",
+            "CB", "MMC", "AON", "PGR", "MET", "PRU", "TROW",
+            # Mid-cap / regional / insurers
+            "KMX", "FITB", "HBAN", "KEY", "RF", "CMA", "PNC", "TRV", "AIG", "ALL"
+        ],
+        "energy": [
+            "XOM", "CVX", "SLB", "COP", "MPC", "PSX", "VLO", "HES", "OXY", "HAL", "BKR", "KMI", "WMB",
+            "DVN", "FANG", "EOG", "PXD", "CTRA",
+            # Mid-cap / services
+            "OKE", "ET", "LNG", "APA", "MRO"
+        ],
+        "industrials": [
+            "CAT", "HON", "GE", "LMT", "BA", "UPS", "UNP", "DE", "RTX", "MMM", "GD", "FDX", "NSC", "EMR",
+            "CP", "CNI", "WM", "RSG", "TT", "ETN",
+            # Mid-cap industrials
+            "ROK", "IR", "CMI", "PH", "ITW", "PCAR"
+        ],
+        "healthcare": [
+            "JNJ", "PFE", "UNH", "ABBV", "LLY", "MRK", "TMO", "DHR", "ISRG", "GILD", "BMY", "AMGN",
+            "CVS", "SYK", "ZTS", "BDX", "BSX", "VRTX",
+            # Mid-cap biotech / medtech
+            "REGN", "HCA", "IQV", "ILMN", "EW"
+        ],
+        "consumer": [
+            "PG", "KO", "PEP", "COST", "WMT", "NKE", "MCD", "DIS", "HD", "LOW", "SBUX", "TJX", "EL",
+            "CL", "MDLZ", "PM", "MO", "TGT", "DG",
+            # Mid-cap / discretionary
+            "ROST", "YUM", "DRI", "LULU", "ETSY", "CHWY"
+        ],
+        "materials": [
+            "LIN", "APD", "SHW", "FCX", "NEM", "NUE", "ECL", "CTVA", "DOW", "DD", "ALB", "MLM", "VMC",
+            "CF", "MOS",
+            # Mid-cap materials / chemicals / miners
+            "IFF", "EMN", "CE", "BLL", "LYB", "SSRM"
+        ],
+        "utilities": [
+            "NEE", "DUK", "SO", "D", "AEP", "EXC", "XEL", "SRE", "WEC", "ES", "DTE", "FE", "ETR",
+            # Mid-cap utilities
+            "AWK", "CMS", "PPL"
+        ],
+        "real_estate": [
+            "PLD", "AMT", "CCI", "EQIX", "WY", "PSA", "DLR", "O", "VICI", "CBRE", "AVB", "EQR",
+            # Mid-cap REITs
+            "EXR", "WELL", "SPG", "ARE", "IRM"
+        ],
     },
     "etfs": {
         "broad": ["SPY", "QQQ", "IWM", "DIA", "EFA", "VWO", "VEA", "TLT", "LQD", "HYG", "SHV", "BIL"],
         "sector": ["XLK", "XLF", "XLE", "XLI", "XLV", "XLP", "XLU", "XLB", "XLRE", "XLY", "XLC"],
         "industries": [
             # Tech / semis / software
-            "SMH", "SOXX", "IGV", "SKYY",
+            "SMH", "SOXX", "IGV", "SKYY", "SOCL", "CLOU",
             # Health / biotech
-            "XBI", "IBB", "IHI",
+            "XBI", "IBB", "IHI", "ARKG",
             # Financials
             "KRE", "KBE", "IAI",
             # Industrials / defense / transports
             "XLI", "ITA", "IYT",
             # Consumer
-            "XHB", "ITB", "XRT",
+            "XHB", "ITB", "XRT", "FDIS",
             # Energy / materials
-            "XOP", "XME", "TAN",
+            "XOP", "XME", "TAN", "PBW",
             # Real estate / infra
             "VNQ", "PAVE",
             # Telecom
-            "XTL"
+            "XTL",
+            # Additional industries / themes
+            "BOTZ", "ROBO", "HACK", "FINX", "SKYY", "KWEB"
         ],
         "commodity_proxies": [
             # Metals
@@ -63,15 +112,17 @@ ASSET_UNIVERSE = {
             # Thematic commodity exposure
             "WOOD", "REMX", "COPX", "LIT", "URA",
             # Softs / ag proxies
-            "CORN", "SOYB", "WEAT", "CANE", "JO", "BAL"
+            "CORN", "SOYB", "WEAT", "CANE", "JO", "BAL",
+            # Additional commodities / themes
+            "GSG", "COMB", "SGOL"
         ],
     },
     "commodities_futures": {
         "precious_metals": ["GC=F", "SI=F", "PL=F", "PA=F"],
         # Keep this set conservative (high-liquidity symbols that are most likely to exist in data feeds)
-        "industrial_metals": ["HG=F"],
+        "industrial_metals": ["HG=F", "SI=F"],
         "energy": ["CL=F", "NG=F", "RB=F", "HO=F", "BZ=F"],
-        "agri_grains": ["ZC=F", "ZS=F", "ZW=F"],
+        "agri_grains": ["ZC=F", "ZS=F", "ZW=F", "ZM=F", "ZL=F"],
         "agri_softs": ["KC=F", "CT=F", "CC=F", "SB=F", "OJ=F"],
         "livestock": ["LE=F", "GF=F", "HE=F"],
     },
@@ -82,8 +133,8 @@ ASSET_UNIVERSE = {
         # and represent gated ones via liquid proxy ETFs in `etfs.commodity_proxies` (e.g., COPX for copper).
         "energy": ["BZUSD"],
         "precious_metals": ["GCUSD", "SIUSD"],
-        "industrial_metals": [],
-        "agri": ["SBUSD", "CTUSD"],
+        "industrial_metals": ["HGUSD", "ALIUSD", "NIUSD", "ZNUSD", "XCUUSD"],
+        "agri": ["SBUSD", "CTUSD", "CCUSD", "KCUSD", "ZCUSD", "ZSUSD", "ZWUSD"],
     },
     "macro_indicators": {
         "rates": ["DGS10", "DGS2", "T10Y2Y", "FEDFUNDS", "DGS30", "T10YIE", "T5YIE", "TEDRATE"],
@@ -116,6 +167,15 @@ COMMODITY_FLOW_PROXY = {
     "KC=F": "JO",
     "CT=F": "BAL",
     "SB=F": "CANE",
+    "ZM=F": "DBA",
+    "ZL=F": "DBA",
+    "HGUSD": "COPX",
+    "ALIUSD": "DBB",
+    "NIUSD": "DBB",
+    "ZNUSD": "DBB",
+    "XCUUSD": "COPX",
+    "CCUSD": "BAL",
+    "KCUSD": "JO",
 }
 
 # Commodity proxy groups (for reporting/flow aggregation)
