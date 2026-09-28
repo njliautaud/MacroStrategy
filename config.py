@@ -1,8 +1,8 @@
 import os
 
-# API Keys (User provided)
-FMP_API_KEY = "REDACTED_FMP_API_KEY" 
-FRED_API_KEY = "REDACTED_FRED_API_KEY "
+# API keys are read from the environment (see .env.example); never commit real keys.
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
+FRED_API_KEY = os.environ.get("FRED_API_KEY", "")
 
 # Data Settings
 START_DATE = "2010-01-01"

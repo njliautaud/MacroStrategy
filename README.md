@@ -80,7 +80,7 @@ Python 3.10+ · pandas / NumPy / SciPy · statsmodels (Granger causality) · hmm
 
 ```bash
 pip install -r requirements.txt
-# set FMP_API_KEY and FRED_API_KEY in config.py to your own keys
+# export FMP_API_KEY and FRED_API_KEY (see .env.example) before running
 
 python run.py               # full pipeline; prompts for "skip holdout retraining" and "lightweight mode"
 python train_and_predict.py # Phase 1: train + save predictions to saved_models/
